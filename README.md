@@ -8,181 +8,146 @@
 
 ---
 
-## 📖 Overview
+## 🏗️ System Architecture
 
-Predicting the progression of Alzheimer's Disease (AD) is challenging due to the stochastic nature of neurodegeneration and irregular visit intervals. This project implements a **Latent SDE** framework that treats the disease trajectory as a continuous stochastic process.
+### 1. High-Level Pipeline (Complete View)
 
-By combining a **Neural ODE drift term** (modeling the mean trend) with a **Diffusion term** (modeling uncertainty), our model captures the full distribution of possible futures. Crucially, it incorporates a **Jump Mechanism** to update its state whenever intermediate real data (e.g., Month 6, 12) is available, ensuring predictions remain improved by all available evidence.
+The system transforms high-dimensional PET scans into a compact latent space, models their specific temporal evolution using an SDE, and reconstructs the future state.
 
-### Key Features
+```mermaid
+graph LR
+    subgraph "Stage 1: Compression"
+    Img[Input PET] --> Enc[AAE Encoder] --> Z0[Latent z_0]
+    end
+    
+    subgraph "Stage 2: Temporal Dynamics"
+    Z0 --> SDE[Latent SDE Model] --> ZT[Latent z_T]
+    end
+    
+    subgraph "Stage 3: Reconstruction"
+    ZT --> Dec[AAE Decoder] --> Pred[Prediction]
+    end
+    
+    style SDE fill:#f96,stroke:#333,stroke-width:2px
+```
 
-- **True Latent SDE**: Solves $dz_t = f(z,t)dt + g(z,t)dw_t$ via `torchsde`.
-- **Uncertainty Quantification**: Implicitly models variance in disease progression.
-- **Missing Data Handling**: Continuous-time integration handles irregular sampling; Jump mechanism incorporates sparse observations.
-- **Disease Conditioning**: Dynamics conditioned on clinical labels (CN, MCI, AD).
+### 2. Latent SDE Architecture (Specific Detail)
 
----
-
-## 🏗️ Architecture
-
-The system operates in a compressed latent space ($28 \times 32 \times 28$) learned by an Adversarial Autoencoder (AAE). The core dynamic model is the **Latent SDE**.
-
-### Unified SDE Framework
-
-The model integrates the latent state from $t=0$ to $t=T$ (Month 24).
+Inside the `Latent SDE Model` block, we solve the equation $dz_t = f(z,t)dt + g(z,t)dw_t$.
 
 ```mermaid
 graph TD
-    %% System Inputs
-    subgraph Conditioning
-    T["Time t"]
-    L["Label c"]
+    subgraph "SDE Integration Process"
+        direction TB
+        
+        state_t["State z(t)"]
+        
+        subgraph "1. Network Evaluation"
+            direction TB
+            f["Drift Network f (U-Net)"]
+            g["Diffusion Network g (CNN)"]
+            
+            state_t --> f
+            state_t --> g
+        end
+        
+        subgraph "2. Solver Step (SRK)"
+            calc["Calculates dz = f*dt + g*dw"]
+            f -.-> calc
+            g -.-> calc
+            step["Integrated State z(t+dt)"]
+            calc --> step
+        end
+
+        subgraph "3. Missing Data Handling"
+            check{"Has Observation?"}
+            jump["Jump Update: z = z + Encoder(z, Obs)"]
+            
+            step --> check
+            check -- "Yes" --> jump --> next["State z(next)"]
+            check -- "No" --> next
+        end
     end
     
-    subgraph "Latent SDE System"
-        direction TB
-        Input["Latent z_0"]
-        
-        %% SDE Solver Box
-        subgraph "SDE Integration (One Step)"
-            direction LR
-            Solver["Solver (SRK)"]
-            f["Drift Network f(z,t)"]
-            g["Diffusion Network g(z,t)"]
-            
-            Solver -.-> f & g
-            f -.->|Mean| Solver
-            g -.->|Variance| Solver
-        end
-
-        %% Missing Data Loop
-        subgraph "Missing Data Handling"
-            Check{"Has Observation?"}
-            Update["Jump Update: z = z + E(z, obs)"]
-            Continue["Continue Integration"]
-        end
-        
-        Input --> Solver
-        Solver --> Check
-        Check --"Yes"--> Update --> Continue
-        Check --"No"--> Continue
-        Continue --> Solver
-        
-    end
-
-    %% Conditioning connections
-    T & L -.-> f & g
-
-    %% Output
-    Solver --> Output["Latent z_24"]
+    next --> state_t
 ```
 
-### Technical Components
+---
 
-1.  **Drift Network ($f$)**: 
-    *   **Backbone**: 3D U-Net with skip connections.
-    *   **Role**: Predicts the anatomical evolution field (e.g., atrophy patterns).
-    *   **Shared**: This same backbone is used for both deterministic (ODE) and stochastic (SDE) modes.
+## ⚙️ Architecture & Parameter Specifications
 
-2.  **Diffusion Network ($g$)**:
-    *   **Backbone**: Lightweight 3D CNN.
-    *   **Role**: Estimates state-dependent diffusion coefficients (diagonal noise).
-    *   **Effect**: Allows the path to deviate stochastically from the mean, capturing biological variance.
+### SDE Components
 
-3.  **Solver**:
-    *   Uses **Strong Runge-Kutta (SRK 1.5)** method for high-order stochastic integration.
+| Component | Architecture | Specification | Rationale |
+|-----------|--------------|---------------|-----------|
+| **Drift ($f$)** | **3D U-Net** | • **3 Encoder Blocks** (Conv3D-GN-Swish)<br>• **Channels**: 32 (Base) $\to$ 64 $\to$ 128<br>• **Conditions**: Time ($sin$ emb) + Label (learned emb) | A U-Net captures multi-scale features. High-res path preserves texture (local metabolism), low-res path captures global atrophy structure. |
+| **Diffusion ($g$)** | **3D CNN** | • **3 Conv Blocks** (No pooling)<br>• **Output**: Softplus (positive noise scale) | Diffusion needs to be spatially adaptive (e.g., higher uncertainty in ventricles) but simpler than Drift. A shallow CNN is sufficient and stable. |
+| **Latent Space** | **Compressed Grid** | • **Shape**: $8 \times 28 \times 32 \times 28$<br>• **Compression Ratio**: ~64x | Direct voxel-wise ODE is intractable. $28^3$ is the "sweet spot" retaining structure while allowing extensive temporal computation. |
+
+### Solver Configuration
+
+*   **Algorithm**: `srk` (Strong Runge-Kutta Order 1.5).
+    *   *Why?* Standard Euler-Maruyama (Order 0.5/1.0) is too imprecise for image generation. SRK offers better convergence for diagonal noise.
+*   **Step Size**: Fixed `dt=0.05`.
+    *   *Why?* Stochastic solvers often struggle with adaptive steps. A fixed fine-grained step ensures stability.
+
+---
+
+## 📖 Overview
+
+Predicting the progression of Alzheimer's Disease (AD) via longitudinal PET scans is critical for early diagnosis. This project leverages continuous-time **Neural SDEs** to model patient trajectories even with **missing intermediate visits**.
+
+### Key Features
+- **Uncertainty Quantification**: Implicitly models variance via the diffusion term.
+- **Robustness**: Handles sparse data (e.g., missing Month 6 scan) naturally via continuous integration.
 
 ---
 
 ## 🚀 Installation
 
 ```bash
-# Clone repository
 git clone https://github.com/avalanchezy/IL-CLDM.git
 cd IL-CLDM
 
-# Create environment
 conda create -n pet-ode python=3.11
 conda activate pet-ode
 
-# Install PyTorch (adjust for your CUDA version)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# Install dependencies (including torchsde)
 pip install -r requirements.txt
-```
-
----
-
-## 📊 Data Preparation
-
-Directory Structure:
-```
-IL-CLDM/
-├── data/
-│   └── {SubjectID}/
-│       ├── *_ses-M00_*_pet.nii.gz    # Baseline
-│       ├── *_ses-M06_*_pet.nii.gz    # (Optional)
-│       └── *_ses-M24_*_pet.nii.gz    # Target
-├── data_info/
-│   ├── data_info.csv
-│   └── train.txt / val.txt / test.txt
-└── result/
 ```
 
 ---
 
 ## ⚡ Training
 
-### Stage 1: Latent Representation (AAE)
-
-Before training the SDE, you must train the Autoencoder to learn the latent space.
-
+### 1. Train AAE (Compression Stage)
 ```bash
-# 1. Train AAE
 python main.py --train_aae
-
-# 2. Encode all data to latent .pt files
 python main.py --enc_all
 ```
 
-### Stage 2: Latent SDE
-
-Train the stochastic dynamic model.
-
+### 2. Train Latent SDE (Dynamics Stage)
 ```bash
-# Train Latent SDE (Recommended)
 python train_ode.py --train --use_sde --data_root ./data
 ```
-
-> **Note**: The baseline deterministic ODE can still be trained by removing `--use_sde`.
 
 ---
 
 ## 🔮 Inference
 
 ```bash
-# Test model performance (PSNR/SSIM)
-python train_ode.py --test --checkpoint result/exp/ODE_best.pth.tar
-
-# Generate NIfTI predictions
+# Generate predictions
 python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
 ```
 
 ---
 
-## 🛠️ Configuration
-
-Key settings in `config.py`:
-
-*   **`ode_solver`**: Algorithm for integration (e.g., `'srk'` for SDE, `'dopri5'` for ODE).
-*   **`latent_dim`**: Channels in latent space (default: 8).
-*   **`ode_hidden_dim`**: Channel width for the Drift U-Net (default: 32).
-
----
+## 🛠️ Configuration (config.py)
+*   `ode_hidden_dim`: 32 (Width of U-Net)
+*   `latent_dim`: 8 (Channels in latent space)
+*   `learning_rate`: 1e-4
 
 ## 📜 Citation
-
 ```bibtex
 @misc{latent-sde-pet,
   title={Latent SDE for Longitudinal PET Prediction},
@@ -190,7 +155,3 @@ Key settings in `config.py`:
   url={https://github.com/avalanchezy/IL-CLDM}
 }
 ```
-
-## 📄 License
-
-Distributed under the MIT License.
