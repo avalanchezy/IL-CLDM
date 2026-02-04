@@ -1,71 +1,176 @@
-# Image-and-Label Conditioning Latent Diffusion Model ：Synthesizing Aβ-PET from MRI for Detecting Amyloid Status
+# IL-CLDM: Image-and-Label Conditioning Latent Diffusion Model
 
-This repo contains the official Pytorch implementation of the paper: Image-and-Label Conditioning Latent Diffusion Model ：Synthesizing Aβ-PET from MRI for Detecting Amyloid Status
+Synthesizing Aβ-PET from MRI for Detecting Amyloid Status
 
-## Contents
+> **Original Paper**: Image-and-Label Conditioning Latent Diffusion Model: Synthesizing Aβ-PET from MRI for Detecting Amyloid Status
 
-1. [Summary of the Model](#1-summary-of-the-model)
-2. [Setup instructions and dependancies](#2-setup-instructions-and-dependancies)
-3. [Running the model](#3-running-the-model)
-4. [Some results of the paper](#4-some-results-of-the-paper)
-5. [Contact](#5-contact)
-6. [License](#6-license)
+## 📋 Contents
 
-## 1. Summary of the Model
+1. [Model Overview](#-model-overview)
+2. [Installation](#-installation)
+3. [Data Preparation](#-data-preparation)
+4. [Training](#-training)
+5. [Results](#-results)
+6. [Project Structure](#-project-structure)
+7. [Contact](#-contact)
+8. [License](#-license)
 
-The following shows the training procedure for our proposed model
+## 🧠 Model Overview
 
-<img src= image\framework.png>
+<img src="image/framework.png">
 
-The image-and-label conditioning latent diffusion model (IL-CLDM) is proposed to synthesize Aβ-PET scans from MRI scans for providing a reliable MRI-based alternative of classifying Aβ as positive or negative. The proposed model incorporates both image and label conditioning modules into the denoising network for preserving subject-specific and diagnosis-specific information.
+The **Image-and-Label Conditioning Latent Diffusion Model (IL-CLDM)** synthesizes Aβ-PET scans from MRI scans for classifying Aβ as positive or negative. The model uses a two-stage training approach:
 
-## 2. Setup instructions and dependancies
+### Two-Stage Training Pipeline
 
-For training/testing the model, you must first download ADNI dataset. You can download the dataset [here](https://adni.loni.usc.edu/data-samples/access-data/). Also for storing the results of the validation/testing datasets, checkpoints and loss logs, the directory structure must in the following way:
+| Stage | Model | Description |
+|-------|-------|-------------|
+| **Stage 1** | AAE (Adversarial Autoencoder) | Compresses 3D PET images into a latent space |
+| **Stage 2** | LDM (Latent Diffusion Model) | Conditional generation in latent space with MRI + Label guidance |
 
-    ├── data                # Follow the way the dataset has been placed here
-    │   ├── whole_Abeta        # Here Abeta-PET images must be placed
-    │   └── whole_MRI          # Here MR images must be placed
-    │   └── latent_Abeta       # This can be empty since the encoding process will generate these latent representations of original Abeta-PET images
-    ├── data_info          # Follow the way the data info has been placed here
-    │   ├── data_info.csv       # This file contains labels for each ID
-    │   ├── train.txt           # This file contains the ID of training dataset, like '037S6046'
-    │   └── validation.txt      # This file contains the ID of validation dataset
-    │   └── test.txt            # This file contains the ID of test dataset
-    ├── result             # Follow the way the result has been placed here
-    │   ├── exp_1              # for experiment 1
-    │   │   └── CHECKPOINT_AAE.pth.tar      # This file is the trained checkpoint for AAE in the first stage
-    │   │   └── CHECKPOINT_Unet.pth.tar     # This file is the trained checkpoint for Unet in the second stage
-    │   │   └── loss_curve.csv              # This file is the loss curve for two stages
-    │   │   └── validation.csv              # This file is the indicator files for two stages in the validation set
-    │   │   └── test.csv                    # This file is the indicator files for two stages in the test set
-    ├── config.py          # This is the configuration file, containing some hyperparameters
-    ├── dataset.py         # This is the dataset file used to preprocess and load data
-    ├── main.py            # This is the main file used to train and test the proposed model
-    ├── model.py           # This is the model file, containing two models (AAE and Unet)
-    ├── README.md
-    ├── utils.py           # This file stores the helper functions required for training
+## 🔧 Installation
 
-## 3. Running the model
+### Requirements
+- Python >= 3.8
+- PyTorch >= 2.0.0
+- CUDA >= 11.8 (recommended)
 
-Users can modify the setting in the config.py to specify the configurations for training/validation/testing. For training/validation/testing the our proposed model:
+### Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/avalanchezy/IL-CLDM.git
+cd IL-CLDM
+
+# Create conda environment
+conda create -n il-cldm python=3.11
+conda activate il-cldm
+
+# Install PyTorch (adjust for your CUDA version)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## 📁 Data Preparation
+
+### 1. Download ADNI Dataset
+Download the ADNI dataset from [here](https://adni.loni.usc.edu/data-samples/access-data/).
+
+### 2. Directory Structure
+```
+IL-CLDM/
+├── data/
+│   ├── process/
+│   │   ├── whole_Abeta_112/    # Preprocessed Aβ-PET images (112×128×112)
+│   │   └── whole_MRI_112/      # Preprocessed MRI images (112×128×112)
+│   ├── latent_Abeta/
+│   │   └── latent_Abeta_112/   # Generated by encoding step
+│   └── syn_Abeta/              # Synthesized PET outputs
+├── data_info/
+│   ├── data_info.csv           # Labels (filename, label_id columns)
+│   ├── train.txt               # Training IDs (e.g., '037S6046.nii.gz')
+│   ├── val.txt                 # Validation IDs
+│   └── test.txt                # Test IDs
+└── result/                     # Checkpoints and logs
+```
+
+### 3. Data Info Format
+
+**data_info.csv**:
+```csv
+filename,label_id
+002S4521.nii.gz,0
+016S4688.nii.gz,1
+...
+```
+
+**train.txt / val.txt / test.txt**:
+```
+002S4521.nii.gz
+016S4688.nii.gz
+...
+```
+
+## 🚀 Training
+
+### Configuration
+Edit `config.py` to set hyperparameters:
+
+```python
+device = "cuda:0"          # GPU device
+epochs = 1000              # Training epochs
+batch_size = 2             # Batch size
+num_classes = 4            # Number of classes (NC, MCI, AD, etc.)
+image_size = 28            # Latent space size (112/4)
+```
+
+### Stage 1: Train AAE
+
+```bash
+# Train the Adversarial Autoencoder
+python main.py --train_aae
+
+# Encode training data to latent space
+python main.py --enc
+```
+
+### Stage 2: Train LDM
+
+```bash
+# Train the Latent Diffusion Model
+python main.py --train_ldm
+```
+
+### Generation
+
+```bash
+# Generate synthetic PET images
+python main.py --gen
+```
+
+### All Available Commands
+
+| Command | Description |
+|---------|-------------|
+| `--train_aae` | Train the AAE model |
+| `--test_aae` | Test the trained AAE |
+| `--enc` | Encode training data using AAE |
+| `--enc_test` | Encode test data using AAE |
+| `--train_ldm` | Train the LDM model |
+| `--gen` | Generate synthetic PET images |
+
+## 📊 Results
+
+<img src="image/result.jpg">
+
+Comparison of synthesized Aβ-PET images from our IL-CLDM model and other competitive methods.
+
+## 📂 Project Structure
 
 ```
-python main.py
+IL-CLDM/
+├── config.py       # Configuration and hyperparameters
+├── dataset.py      # Dataset classes (OneDataset, TwoDataset)
+├── main.py         # Main training/testing entry point
+├── model.py        # Model architectures (AAE, UNet, Diffusion)
+├── utils.py        # Helper functions
+├── requirements.txt # Python dependencies
+└── README.md       # This file
 ```
 
-## 4. Some results of the paper
+### Key Components in `model.py`
+- **Encoder/Decoder**: 3D convolutional autoencoder
+- **AAE**: Adversarial Autoencoder with discriminator
+- **UNet**: Noise prediction network with time/label embeddings
+- **EMA**: Exponential Moving Average for stable training
 
-Some of the results produced by our proposed model and competitive models are as follows. *For more such results, consider seeing the main paper and also its supplementary section*
+## 📧 Contact
 
-<img src=image\result.jpg>
+If you have any questions, please open an issue or contact:
+- Original authors: ouzx2022@shanghaitech.edu.cn
 
-## 5. Contact
+## 📄 License
 
-If you have found our research work helpful, please consider citing the original paper.
-
-If you have any doubt regarding the codebase, you can open up an issue or mail at ouzx2022@shanghaitech.edu.cn
-
-## 6. License
-
-This repository is licensed under MIT license
+This repository is licensed under the MIT License.

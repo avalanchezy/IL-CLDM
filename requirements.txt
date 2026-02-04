@@ -1,0 +1,19 @@
+# PyTorch (install separately based on your CUDA version)
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Metrics
+torchmetrics>=1.0.0
+scikit-image>=0.20.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+nibabel>=5.0.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Optional: for visualization
+matplotlib>=3.7.0
