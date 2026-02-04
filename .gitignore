@@ -1,5 +1,6 @@
 # Data files
-data/
+*.nii
+*.nii.gz
 
 # Python cache
 __pycache__/
