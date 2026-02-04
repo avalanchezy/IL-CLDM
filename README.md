@@ -20,7 +20,7 @@ graph LR
     Img[Input PET] --> Enc[AAE Encoder] --> Z0[Latent z_0]
     end
     
-    subgraph "Stage 2: Temporal Dynamics"
+    subgraph "Stage 2: Prediction"
     Z0 --> SDE[Latent SDE Model] --> ZT[Latent z_T]
     end
     
