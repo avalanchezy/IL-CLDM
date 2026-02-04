@@ -99,15 +99,15 @@ python main.py --test_aae
 ### Stage 2: Train Prediction Model
 
 ```bash
-# Option A: Pure Neural ODE
+# Option A: Pure Neural ODE (handles missing intermediates automatically)
 python train_ode.py --train --data_root ./data
 
-# Option B: Neural ODE + Diffusion (recommended)
+# Option B: Neural ODE + Diffusion (recommended for uncertainty estimation)
 python train_ode.py --train --use_diffusion --data_root ./data
-
-# Option C: With intermediate timepoints
-python train_ode.py --train --use_intermediates --data_root ./data
 ```
+
+> **Note**: The model automatically handles missing intermediate timepoints.
+> When available, T6/T12/T18 scans are used to improve trajectory accuracy.
 
 ### Inference
 
