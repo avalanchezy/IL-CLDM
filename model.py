@@ -1,24 +1,45 @@
-import math
+"""
+Model architectures for longitudinal PET prediction.
+
+Contains:
+- AAE (Adversarial Autoencoder) for image compression
+- EMA (Exponential Moving Average) for stable training
+
+For Neural ODE models, see ode_model.py
+"""
+
 import torch
 from torch import nn
 import config
-from inspect import isfunction
 
-# Basic components
+
+# ============================================================
+# Basic Components
+# ============================================================
 
 class Swish(nn.Module):
+    """Swish activation function: x * sigmoid(x)"""
     def forward(self, x):
         return x * torch.sigmoid(x)
 
+
 class GroupNorm(nn.Module):
-    def __init__(self, channels):
+    """Group Normalization wrapper."""
+    def __init__(self, channels, num_groups=16):
         super(GroupNorm, self).__init__()
-        self.gn = nn.GroupNorm(num_groups=16, num_channels=channels, eps=1e-6, affine=True)
+        self.gn = nn.GroupNorm(
+            num_groups=min(num_groups, channels), 
+            num_channels=channels, 
+            eps=1e-6, 
+            affine=True
+        )
 
     def forward(self, x):
         return self.gn(x)
 
+
 class Upsample(nn.Module):
+    """3D Upsampling with transposed convolution."""
     def __init__(self, dim):
         super().__init__()
         self.conv = nn.ConvTranspose3d(dim, dim, 4, 2, padding=1)
@@ -26,7 +47,9 @@ class Upsample(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+
 class Downsample(nn.Module):
+    """3D Downsampling with strided convolution."""
     def __init__(self, dim):
         super().__init__()
         self.conv = nn.Conv3d(dim, dim, 4, 2, padding=1)
@@ -34,13 +57,18 @@ class Downsample(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
+
+# ============================================================
 # Adversarial Autoencoder (AAE)
+# ============================================================
 
 class ResidualBlock(nn.Module):
+    """Residual block for 3D data."""
     def __init__(self, in_channels, out_channels):
         super(ResidualBlock, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        
         self.block = nn.Sequential(
             GroupNorm(in_channels),
             nn.ReLU(),
@@ -59,39 +87,64 @@ class ResidualBlock(nn.Module):
         else:
             return x + self.block(x)
 
+
 class Encoder(nn.Module):
-    def __init__(self, image_channels = 1, latent_dim =config.latent_dim):
+    """
+    3D Encoder for PET images.
+    
+    Input: (B, 1, 112, 128, 112)
+    Output: (B, latent_dim, 28, 32, 28)
+    
+    Downsamples by factor of 4 in each spatial dimension.
+    """
+    def __init__(self, image_channels=1, latent_dim=config.latent_dim):
         super(Encoder, self).__init__()
+        
         channels = [16, 32, 64]
         num_res_blocks = 1
+        
         layers = [nn.Conv3d(image_channels, channels[0], 3, 1, 1)]
-        for i in range(len(channels)-1):
+        
+        for i in range(len(channels) - 1):
             in_channels = channels[i]
             out_channels = channels[i + 1]
             for j in range(num_res_blocks):
                 layers.append(ResidualBlock(in_channels, out_channels))
                 in_channels = out_channels
-            if i != len(channels)-1:
-                layers.append(Downsample(channels[i+1]))
+            if i != len(channels) - 1:
+                layers.append(Downsample(channels[i + 1]))
+        
         layers.append(ResidualBlock(channels[-1], channels[-1]))
         layers.append(GroupNorm(channels[-1]))
         layers.append(nn.ReLU())
         layers.append(nn.Conv3d(channels[-1], latent_dim, 3, 1, 1))
+        
         self.model = nn.Sequential(*layers)
-       
+
     def forward(self, x):
-        out = self.model(x)
-        return out
+        return self.model(x)
+
 
 class Decoder(nn.Module):
-    def __init__(self, image_channels = 1, latent_dim = config.latent_dim):
+    """
+    3D Decoder for PET images.
+    
+    Input: (B, latent_dim, 28, 32, 28)
+    Output: (B, 1, 112, 128, 112)
+    
+    Upsamples by factor of 4 in each spatial dimension.
+    """
+    def __init__(self, image_channels=1, latent_dim=config.latent_dim):
         super(Decoder, self).__init__()
+        
         channels = [64, 32, 16]
         num_res_blocks = 1
 
         in_channels = channels[0]
-        layers = [nn.Conv3d(latent_dim, in_channels, 3, 1, 1),
-                  ResidualBlock(in_channels, in_channels)]
+        layers = [
+            nn.Conv3d(latent_dim, in_channels, 3, 1, 1),
+            ResidualBlock(in_channels, in_channels)
+        ]
 
         for i in range(len(channels)):
             out_channels = channels[i]
@@ -104,12 +157,24 @@ class Decoder(nn.Module):
         layers.append(GroupNorm(in_channels))
         layers.append(nn.ReLU())
         layers.append(nn.Conv3d(in_channels, image_channels, 3, 1, 1))
+        
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.model(x)
 
+
 class AAE(nn.Module):
+    """
+    Adversarial Autoencoder for 3D PET images.
+    
+    Compresses PET images to a lower-dimensional latent space
+    for efficient temporal modeling with Neural ODE.
+    
+    Input: (B, 1, 112, 128, 112)
+    Latent: (B, 1, 28, 32, 28)
+    Output: (B, 1, 112, 128, 112)
+    """
     def __init__(self):
         super(AAE, self).__init__()
         self.encoder = Encoder()
@@ -119,22 +184,42 @@ class AAE(nn.Module):
         encoded_data = self.encoder(data)
         decoded_data = self.decoder(encoded_data)
         return decoded_data
+    
+    def encode(self, data):
+        """Encode data to latent space."""
+        return self.encoder(data)
+    
+    def decode(self, latent):
+        """Decode latent representation to image."""
+        return self.decoder(latent)
+
 
 class Discriminator(nn.Module):
-    def __init__(self, image_channels = 1, channels = [16, 32, 64, 128]):
+    """
+    3D Discriminator for adversarial training.
+    
+    Distinguishes between real and reconstructed PET images.
+    """
+    def __init__(self, image_channels=1, channels=[16, 32, 64, 128]):
         super(Discriminator, self).__init__()
 
-        layers = [nn.Conv3d(image_channels, channels[0], 4, 2, 1), nn.LeakyReLU(0.2)]
+        layers = [
+            nn.Conv3d(image_channels, channels[0], 4, 2, 1), 
+            nn.LeakyReLU(0.2)
+        ]
+        
         layers += [
             nn.Conv3d(channels[0], channels[1], 4, 2, 1, bias=False),
             nn.BatchNorm3d(channels[1]),
             nn.LeakyReLU(0.2, True)
         ]
+        
         layers += [
             nn.Conv3d(channels[1], channels[2], 4, 2, 1, bias=False),
             nn.BatchNorm3d(channels[2]),
             nn.LeakyReLU(0.2, True)
         ]
+        
         layers += [
             nn.Conv3d(channels[2], channels[3], 4, 2, 1, bias=False),
             nn.BatchNorm3d(channels[3]),
@@ -142,255 +227,24 @@ class Discriminator(nn.Module):
         ]
 
         layers.append(nn.Conv3d(channels[3], image_channels, 4, 2, 1))
+        
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.model(x)
 
-# Unet
 
-def exists(x):
-    return x is not None
-
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
-
-class TimeEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        inv_freq = torch.exp(
-            torch.arange(0, dim, 2, dtype=torch.float32) *
-            (-math.log(10000) / dim)
-        )
-        self.register_buffer("inv_freq", inv_freq)
-
-    def forward(self, input):
-        shape = input.shape
-        sinusoid_in = torch.ger(input.view(-1).float(), self.inv_freq)
-        pos_emb = torch.cat([sinusoid_in.sin(), sinusoid_in.cos()], dim=-1)
-        pos_emb = pos_emb.view(*shape, self.dim)
-        return pos_emb
-
-class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=32, dropout=0):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.GroupNorm(groups, dim),
-            Swish(),
-            nn.Dropout(dropout) if dropout != 0 else nn.Identity(),
-            nn.Conv3d(dim, dim_out, 3, padding=1)
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, time_emb_dim=None, dropout=0, norm_groups=32):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            Swish(),
-            nn.Linear(time_emb_dim, dim_out)
-        ) if exists(time_emb_dim) else None
-
-        self.block1 = Block(dim, dim_out, groups=norm_groups)
-        self.block2 = Block(dim_out, dim_out, groups=norm_groups, dropout=dropout)
-        self.res_conv = nn.Conv3d(
-            dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x, time_emb):
-        h = self.block1(x)
-        if exists(self.mlp):
-            h += self.mlp(time_emb)[:, :, None, None, None]
-        h = self.block2(h)
-        return h + self.res_conv(x)
-
-class SelfAttention(nn.Module):
-    def __init__(self, in_channel, n_head=1, norm_groups=32):
-        super().__init__()
-
-        self.n_head = n_head
-
-        self.norm = nn.GroupNorm(norm_groups, in_channel)
-        self.qkv = nn.Conv3d(in_channel, in_channel * 3, 1, bias=False)
-        self.out = nn.Conv3d(in_channel, in_channel, 1)
-
-    def forward(self, input):
-        batch, channel, height, width, depth = input.shape
-        n_head = self.n_head
-        head_dim = channel // n_head
-
-        norm = self.norm(input)
-        qkv = self.qkv(norm).view(batch, n_head, head_dim * 3, height, width, depth)
-        query, key, value = qkv.chunk(3, dim=2)  # bhdyx
-
-        attn = torch.einsum(
-            "bnchwd, bncyxz -> bnhwdyxz", query, key
-        ).contiguous() / math.sqrt(channel)
-        attn = attn.view(batch, n_head, height, width, depth, -1)
-        attn = torch.softmax(attn, -1)
-        attn = attn.view(batch, n_head, height, width, depth, height, width, depth)
-
-        out = torch.einsum("bnhwdyxz, bncyxz -> bnchwd", attn, value).contiguous()
-        out = self.out(out.view(batch, channel, height, width, depth))
-
-        return out + input
-
-class ResnetBlocWithAttn(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, norm_groups=32, dropout=0, with_attn=False):
-        super().__init__()
-        self.with_attn = with_attn
-        self.res_block = ResnetBlock(
-            dim, dim_out, time_emb_dim, norm_groups=norm_groups, dropout=dropout)
-        if with_attn:
-            self.attn = SelfAttention(dim_out, norm_groups=norm_groups)
-
-    def forward(self, x, time_emb):
-        x = self.res_block(x, time_emb)
-        if(self.with_attn):
-            x = self.attn(x)
-        return x
-
-class UNet(nn.Module):
-    def __init__(
-        self,
-        in_channel=2,
-        out_channel=1,
-        inner_channel=128,
-        norm_groups=32,
-        channel_mults=(1, 2, 2), # hjx, ori: (1, 2, 2, 4),
-        attn_res=(3,), # hjx, ori: (4,),
-        res_blocks=2,
-        dropout=0,
-        with_time_emb=True,
-        image_size=28   # hjx, ori: 40
-    ):
-        super().__init__()
-
-        if with_time_emb:
-            time_dim = config.time_dim
-            self.time_mlp = nn.Sequential(
-                TimeEmbedding(time_dim),
-                nn.Linear(time_dim, time_dim * 4),
-                Swish(),
-                nn.Linear(time_dim * 4, time_dim)
-            )
-        else:
-            time_dim = None
-            self.time_mlp = None
-
-        num_mults = len(channel_mults)
-        pre_channel = inner_channel
-        feat_channels = [pre_channel]
-        now_res = image_size
-        downs = [nn.Conv3d(in_channel, inner_channel,
-                           kernel_size=3, padding=1)]
-        for ind in range(num_mults):
-            is_last = (ind == num_mults - 1)
-            use_attn = (now_res in attn_res)
-            print(f"第{ind+1}层: now_res = {now_res}, use_attn = {use_attn}")
-            channel_mult = inner_channel * channel_mults[ind]
-            for _ in range(0, res_blocks):
-                downs.append(ResnetBlocWithAttn(
-                    pre_channel, channel_mult, time_emb_dim=time_dim, norm_groups=norm_groups, dropout=dropout, with_attn=use_attn))
-                feat_channels.append(channel_mult)
-                pre_channel = channel_mult
-            if not is_last:
-                downs.append(Downsample(pre_channel))
-                feat_channels.append(pre_channel)
-                now_res = now_res//2
-        self.downs = nn.ModuleList(downs)
-
-        self.mid = nn.ModuleList([
-            ResnetBlocWithAttn(pre_channel, pre_channel, time_emb_dim=time_dim, norm_groups=norm_groups,
-                               dropout=dropout, with_attn=True),
-            ResnetBlocWithAttn(pre_channel, pre_channel, time_emb_dim=time_dim, norm_groups=norm_groups, 
-                                dropout=dropout, with_attn=False)
-        ])
-
-        ups = []
-        for ind in reversed(range(num_mults)):
-            is_last = (ind < 1)
-            use_attn = (now_res in attn_res)
-            channel_mult = inner_channel * channel_mults[ind]
-            for _ in range(0, res_blocks+1):
-                ups.append(ResnetBlocWithAttn(
-                    pre_channel+feat_channels.pop(), channel_mult, time_emb_dim=time_dim, dropout=dropout, norm_groups=norm_groups, with_attn=use_attn))
-                pre_channel = channel_mult
-            if not is_last:
-                ups.append(Upsample(pre_channel))
-                now_res = now_res*2
-
-        self.ups = nn.ModuleList(ups)
-        self.final_conv = Block(pre_channel, default(out_channel, in_channel), groups=norm_groups)
-        self.cond = nn.Sequential(
-            nn.Conv3d(1, 16, 4, 2, 1),
-            ResidualBlock(16, 16),
-            GroupNorm(16),
-            Swish(),
-            nn.Conv3d(16, 1, 4, 2, 1),
-            )
-        self.label_emb = nn.Embedding(config.num_classes, time_dim)
-
-
-    def forward(self, x, y, time, label=None):
-        cond = self.cond(y)
-        x = torch.cat([x,cond],dim=1)
-        feats = []
-
-        t = self.time_mlp(time) if exists(self.time_mlp) else None
-        if label is not None:
-            # if label.dtype != torch.long:
-            #     print("WARN: label dtype", label.dtype, "-> casting to long")
-            # print("label shape before squeeze:", label.shape)
-            label = label.squeeze()
-            label = label.long()
-            k = self.label_emb(label)
-            t =  t + k
-
-        for layer in self.downs:
-            if isinstance(layer, ResnetBlocWithAttn):
-                x = layer(x, t)
-            else:
-                x = layer(x)
-            #print(f"downs:{x.shape}")
-            feats.append(x)
-
-        for layer in self.mid:
-            if isinstance(layer, ResnetBlocWithAttn):
-                x = layer(x, t)
-            else:
-                x = layer(x)
-            #print(f"mid:{x.shape}")
-
-        for layer in self.ups:
-            if isinstance(layer, ResnetBlocWithAttn):
-                # x = layer(torch.cat((x, feats.pop()), dim=1), t)
-                ###### hjx ######
-                skip = feats.pop()
-                x = match_to(x, skip)                     # 先对齐
-                x = layer(torch.cat([x, skip], dim=1), t) # 再拼接
-                ###### hjx ######
-            else:
-                x = layer(x)
-            #print(f"ups:{x.shape}")
-
-        return self.final_conv(x)
-
-
-###### hjx ######
-import torch.nn.functional as F
-def match_to(x, ref):  # 统一到 ref 的 D,H,W
-    if x.shape[2:] == ref.shape[2:]:
-        return x
-    return F.interpolate(x, size=ref.shape[2:], mode='trilinear', align_corners=False)
-###### hjx ######
-
+# ============================================================
+# Training Utilities
+# ============================================================
 
 class EMA:
-    def __init__(self, beta):
+    """
+    Exponential Moving Average for model parameters.
+    
+    Maintains a smoothed version of model weights for more stable predictions.
+    """
+    def __init__(self, beta=0.9999):
         super().__init__()
         self.beta = beta
         self.step = 0
@@ -415,3 +269,35 @@ class EMA:
 
     def reset_parameters(self, ema_model, model):
         ema_model.load_state_dict(model.state_dict())
+
+
+# ============================================================
+# Testing
+# ============================================================
+
+if __name__ == "__main__":
+    device = config.device
+    
+    # Test AAE
+    print("Testing AAE...")
+    model = AAE().to(device)
+    x = torch.randn(2, 1, 112, 128, 112).to(device)
+    
+    # Encode
+    z = model.encode(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Latent shape: {z.shape}")
+    
+    # Decode
+    x_recon = model.decode(z)
+    print(f"Reconstructed shape: {x_recon.shape}")
+    
+    # Full forward
+    x_out = model(x)
+    print(f"Full forward output shape: {x_out.shape}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+    
+    print("\nAll tests passed!")

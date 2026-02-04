@@ -1,102 +1,73 @@
+"""
+Dataset for PET image loading.
+
+Used for AAE training (Stage 1).
+For longitudinal prediction, use dataset_longitudinal.py.
+"""
+
 from torch.utils.data import Dataset
 import nibabel as nib
-import pandas as pd
 import numpy as np
-import config
 import os
+import config
+
 
 def read_list(file):
-    file=open(file,"r")
-    S=file.read().split()
-    p=list(str(i) for i in S)
-    return p
+    """Read list of subject IDs from file."""
+    with open(file, "r") as f:
+        lines = f.read().split()
+    return list(str(i) for i in lines)
+
 
 def nifti_to_numpy(file):
+    """Load NIfTI file and return numpy array."""
     data = nib.load(file).get_fdata()
     data = data.astype(np.float32)
     return data
 
-def random_translation(data1):
-    # ±2体素的随机平移抖动,在三个轴上各随机取一个位移 i,j,z ∈ {-2,-1,0,1,2}
-    # i=np.random.randint(-2,3)
-    # j=np.random.randint(-2,3)
-    # z=np.random.randint(-2,3)
-    # return data1[10+i:170+i,18+j:210+j,10+z:170+z]
 
-    ###### hjx ######
-    return data1    # (112, 128, 112)
-    ###### hjx ######
-
-
-def crop(data1):
-    # return data1[10:170,18:210,10:170]
-    ###### hjx ######
-    return data1    # (112, 128, 112)
-    ###### hjx ######
-
-
-
-
-
-# This is for the training of the first stage
 class OneDataset(Dataset):
-    def __init__(self, root_Abeta = config.whole_Abeta, task = config.train, stage = "train"):
+    """
+    Dataset for single-timepoint PET images.
+    Used for AAE training (Stage 1).
+    """
+    
+    def __init__(self, root_Abeta=config.whole_Abeta, task=config.train, stage="train"):
+        """
+        Args:
+            root_Abeta: Root directory containing PET images
+            task: Path to file with subject IDs
+            stage: 'train', 'validation', or 'test'
+        """
         self.root_Abeta = root_Abeta
         self.task = task
-        self.images = read_list(self.task)
-        self.length_dataset = len(self.images)
-        self.len = len(self.images)
         self.stage = stage
-
-    def __len__(self):
-        return self.length_dataset
-
-    def __getitem__(self, index):
-        name = self.images[index % self.len]# + ".nii"
-        path_Abeta = os.path.join(self.root_Abeta, name)
-        Abeta = nifti_to_numpy(path_Abeta)
-        if self.stage == "train":
-            Abeta = random_translation(Abeta)
+        
+        if os.path.exists(task):
+            self.images = read_list(task)
         else:
-            Abeta = crop(Abeta)
-        return Abeta, name
-
-# This is for the training of the second stage: train_LDM
-class TwoDataset(Dataset):
-    def __init__(self,root_MRI = config.whole_MRI, root_Abeta = config.whole_Abeta, task = config.train, stage = "train"):
-        self.root_Abeta = root_Abeta
-        self.root_MRI = root_MRI
-        self.task = task
-        self.images = read_list(self.task)
+            # Auto-discover images if task file doesn't exist
+            self.images = self._discover_images()
+        
         self.length_dataset = len(self.images)
         self.len = len(self.images)
-        self.stage = stage
+
+    def _discover_images(self):
+        """Auto-discover images from directory."""
+        images = []
+        if os.path.exists(self.root_Abeta):
+            for f in os.listdir(self.root_Abeta):
+                if f.endswith('.nii.gz') or f.endswith('.nii'):
+                    images.append(f)
+        return images
 
     def __len__(self):
         return self.length_dataset
 
     def __getitem__(self, index):
-        name = self.images[index % self.len]# + ".nii"
+        name = self.images[index % self.len]
         path_Abeta = os.path.join(self.root_Abeta, name)
+        
         Abeta = nifti_to_numpy(path_Abeta)
-        path_MRI = os.path.join(self.root_MRI, name)
-        MRI = nifti_to_numpy(path_MRI)
-        MRI = crop(MRI)
-        if self.stage != "train":
-            Abeta = crop(Abeta)
-        data = pd.read_csv("data_info/data_info.csv",encoding = "ISO-8859-1")
-
-        # label = data[data['ID'] == name[0:-4]]['label']
-        ###### hjx ######
-        label = data[data['filename'] == name]['label_id']
-        # print(name)
-        # print(label)
-        ###### hjx ######
-
-        label=label.values
-        label=label.astype(np.float32)
-
-        return MRI, Abeta, name, label
-
-
-
+        
+        return Abeta, name
