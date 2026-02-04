@@ -105,6 +105,9 @@ graph TD
 *   **Why U-Net for Drift ($f$)?**
     *   **Structure Preservation**: Disease progression in PET (e.g., Alzheimer's hypometabolism) is localized but structurally correlated. A U-Net backbone captures both local textures and global patterns via skip connections.
 
+*   **Shared Architecture**:
+    *   **Consistency**: Notably, both **Latent ODE** and **Latent SDE** share this **identical 3D U-Net** for the drift term ($f$). The SDE model simply adds a lightweight parallel branch ($g$) to model the variance, ensuring the core dynamics remain stable and comparable.
+
 *   **Why Latent SDE?**
     *   **Uncertainty**: Disease progression is inherently stochastic. SDE introduces diffusion ($g$) that models the *variance* of progression, allowing us to estimate confidence intervals.
 
