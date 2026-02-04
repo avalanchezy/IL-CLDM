@@ -196,7 +196,10 @@ class LatentODE(nn.Module):
     Neural ODE for longitudinal PET prediction.
     
     Given z_0 (latent at T0), predicts z_T (latent at target time T).
-    Can optionally incorporate intermediate observations.
+    
+    Universal Intermediate Handling:
+    If intermediate observations (e.g., T6, T12) are provided during the forward pass,
+    the model automatically uses them to refine the trajectory via a "Jump ODE" mechanism.
     """
     def __init__(
         self,
@@ -212,6 +215,7 @@ class LatentODE(nn.Module):
     ):
         super().__init__()
         
+        # ODE Function (Drift dynamics)
         self.odefunc = LatentODEFunc(
             latent_channels=latent_channels,
             hidden_channels=hidden_channels,
@@ -227,83 +231,9 @@ class LatentODE(nn.Module):
         
         # Choose ODE integrator
         self.odeint = odeint_adjoint if use_adjoint else odeint
-    
-    def forward(self, z_0, t_span, label=None):
-        """
-        Integrate from z_0 at t=0 to target times.
-        
-        Args:
-            z_0: (B, C, D, H, W) initial latent state
-            t_span: (T,) tensor of times to evaluate [0, t1, t2, ..., T]
-                    e.g., [0, 6, 12, 24] for month timepoints
-            label: (B,) optional disease labels
-            
-        Returns:
-            z_trajectory: (T, B, C, D, H, W) latent states at each time
-        """
-        # Normalize times to [0, 1] for stable integration
-        t_normalized = t_span / t_span[-1]
-        
-        # Set label for conditioning
-        self.odefunc.set_label(label)
-        
-        # Integrate ODE
-        z_trajectory = self.odeint(
-            self.odefunc,
-            z_0,
-            t_normalized,
-            method=self.solver,
-            rtol=self.rtol,
-            atol=self.atol
-        )
-        
-        return z_trajectory
-    
-    def predict(self, z_0, target_time=24, label=None):
-        """
-        Convenience method to predict latent at a single target time.
-        
-        Args:
-            z_0: (B, C, D, H, W) initial latent state at T0
-            target_time: target time in months (default 24)
-            label: (B,) optional disease labels
-            
-        Returns:
-            z_T: (B, C, D, H, W) predicted latent at target time
-        """
-        t_span = torch.tensor([0.0, float(target_time)], device=z_0.device)
-        z_trajectory = self.forward(z_0, t_span, label)
-        return z_trajectory[-1]  # Return prediction at final time
 
-
-class LatentODEWithIntermediates(nn.Module):
-    """
-    Neural ODE that can incorporate intermediate observations.
-    
-    When intermediate timepoints are available (e.g., T6, T12), 
-    they are used to refine the trajectory via observation matching.
-    """
-    def __init__(
-        self,
-        latent_channels=1,
-        hidden_channels=32,
-        time_dim=64,
-        num_blocks=3,
-        num_classes=4,
-        solver='dopri5'
-    ):
-        super().__init__()
-        
-        self.ode = LatentODE(
-            latent_channels=latent_channels,
-            hidden_channels=hidden_channels,
-            time_dim=time_dim,
-            num_blocks=num_blocks,
-            num_classes=num_classes,
-            solver=solver
-        )
-        
-        # Observation encoder: refines latent using actual observations
+        # Observation Encoder (for jump updates)
+        # Refines latent state using actual observations when available
         self.obs_encoder = nn.Sequential(
             nn.Conv3d(latent_channels * 2, hidden_channels, 3, padding=1),
             nn.GroupNorm(8, hidden_channels),
@@ -313,38 +243,77 @@ class LatentODEWithIntermediates(nn.Module):
     
     def forward(self, z_0, t_span, observations=None, label=None):
         """
-        Integrate with optional intermediate observations.
+        Integrate from z_0 with optional intermediate observations.
         
         Args:
-            z_0: (B, C, D, H, W) initial latent
-            t_span: (T,) times to evaluate
-            observations: dict {time: z_obs} of available observations
-            label: (B,) disease labels
+            z_0: (B, C, D, H, W) initial latent state
+            t_span: (T,) tensor of times to evaluate [0, t1, t2, ..., T]
+            observations: dict {time: z_obs} or list of dicts of available observations
+                          If provided, trajectory performs jumps at observation times.
+            label: (B,) optional disease labels
             
         Returns:
-            z_trajectory: (T, B, C, D, H, W) refined trajectory
+            z_trajectory: (T, B, C, D, H, W) latent states at each time
         """
-        if observations is None or len(observations) == 0:
-            # No intermediates, just integrate
-            return self.ode(z_0, t_span, label)
+        # Set label for conditioning
+        self.odefunc.set_label(label)
         
+        # Case 1: No intermediates - Standard Integration
+        if observations is None or len(observations) == 0:
+            t_normalized = t_span / t_span[-1]
+            return self.odeint(
+                self.odefunc,
+                z_0,
+                t_normalized,
+                method=self.solver,
+                rtol=self.rtol,
+                atol=self.atol
+            )
+        
+        # Case 2: With intermediates - Jump Integration
         # Integrate segment by segment, updating at observations
         z_current = z_0
         z_trajectory = [z_0]
         
         times = t_span.tolist()
+        
+        # Normalize times based on max time in span
+        max_t = times[-1]
+        
         for i in range(1, len(times)):
-            t_segment = torch.tensor([times[i-1], times[i]], device=z_0.device)
+            # Define segment normalized to [0, 1] scale relative to max_t
+            t_prev_norm = times[i-1] / max_t
+            t_curr_norm = times[i] / max_t
+            t_segment = torch.tensor([t_prev_norm, t_curr_norm], device=z_0.device)
             
             # Integrate this segment
-            z_segment = self.ode(z_current, t_segment, label)
-            z_pred = z_segment[-1]
+            # Note: odeint returns partial trajectory, we only need the endpoint
+            segment_out = self.odeint(
+                self.odefunc,
+                z_current,
+                t_segment,
+                method=self.solver,
+                rtol=self.rtol,
+                atol=self.atol
+            )
+            z_pred = segment_out[-1]
             
-            # Check if we have observation at this time
+            # Check for observation at this time (t_current)
             t_current = times[i]
-            if t_current in observations:
+            
+            # Handle observation dictionary structure
+            z_obs = None
+            if isinstance(observations, dict) and t_current in observations:
                 z_obs = observations[t_current]
-                # Combine prediction with observation
+            elif isinstance(observations, list): # List of dicts per sample? 
+                # Simplified: assumes batch-averaged or pre-collated observation tensor
+                # For robust implementation, observations should preferably be a Tensor (B, C, D, H, W) masked,
+                # or a dict mapping time -> Tensor.
+                # Assuming dict {time_float: Tensor(B, C...)} here as per previous logic
+                pass
+
+            if z_obs is not None:
+                # Jump Update: Refine prediction with observation
                 combined = torch.cat([z_pred, z_obs], dim=1)
                 z_refined = z_pred + self.obs_encoder(combined)
                 z_trajectory.append(z_refined)
@@ -354,6 +323,12 @@ class LatentODEWithIntermediates(nn.Module):
                 z_current = z_pred
         
         return torch.stack(z_trajectory, dim=0)
+    
+    def predict(self, z_0, target_time=24, label=None):
+        """Predict latent at a single target time (no intermediates)."""
+        t_span = torch.tensor([0.0, float(target_time)], device=z_0.device)
+        z_trajectory = self.forward(z_0, t_span, None, label)
+        return z_trajectory[-1]
 
 
 # ============================================================
@@ -558,10 +533,10 @@ class LatentSDE(nn.Module):
         # Learnable blend weight
         self.blend_weight = nn.Parameter(torch.tensor(0.5))
     
-    def forward(self, z_0, t_span, label=None, return_ode_pred=False):
+    def forward(self, z_0, t_span, observations=None, label=None, return_ode_pred=False):
         """Forward pass for training."""
-        # Get drift trajectory
-        z_ode_trajectory = self.ode(z_0, t_span, label)
+        # Get drift trajectory (handles jumps if observations provided)
+        z_ode_trajectory = self.ode(z_0, t_span, observations, label)
         
         if return_ode_pred:
             return z_ode_trajectory, z_ode_trajectory

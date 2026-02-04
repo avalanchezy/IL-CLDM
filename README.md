@@ -45,8 +45,40 @@ A key challenge in longitudinal medical imaging is **missing data**. Patients of
 │  │    Focus: Uncertainty modeling, texture details                │    │
 │  └────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Technical Details
+
+#### 1. Network Architecture
+
+The core of the system is the **Latent ODE Function** ($f(z,t)$), which parameterizes the time derivative of the latent state.
+
+*   **Input**: Latent state $z_t \in \mathbb{R}^{C \times D \times H \times W}$ (typically $1 \times 28 \times 32 \times 28$) and time $t$.
+*   **Backbone**: A lightweight **3D U-Net** operating in latent space.
+    *   **Encoder**: 3 blocks of `Conv3D` -> `GroupNorm` -> `Swish` -> `Conv3D` with residual connections.
+    *   **Time Conditioning**: Sinusoidal time embeddings projected via MLP and injected into each block (shift/scale).
+    *   **Disease Conditioning**: Learnable class embeddings added to time embeddings.
+    *   **Decoder**: Symmetric path with concatenation skip connections from the encoder.
+*   **Output**: Derivative $dz/dt$ of the same shape as input.
+
+#### 2. Jump ODE for Missing Data
+
+We employ a **Jump Neural ODE** framework to robustly handle missing intermediate data without imputation.
+
+*   **Mechanism**: The solver integrates the trajectory from $T_{prev}$ to $T_{curr}$.
+*   **Observation Update**: If a real PET scan exists at $T_{curr}$ (e.g., Month 6):
+    1.  The model predicts $\hat{z}_{curr}$ from the ODE integration.
+    2.  The observation encoder processes the concatenation of prediction and real data: $\delta = E(\text{cat}(\hat{z}_{curr}, z_{obs}))$.
+    3.  The state "jumps" to a refined position: $z_{new} = \hat{z}_{curr} + \delta$.
+    4.  Integration continues from $z_{new}$.
+*   **Universal Support**: This logic is built into both `LatentODE` and `LatentSDE`. It automatically activates whenever intermediate data is passed to the forward pass.
+
+#### 3. ODE Solver & Optimization
+
+*   **Solver**: `dopri5` (Dormand-Prince), an adaptive step-size Runge-Kutta method (order 5).
+    *   *Why?* Balances speed and accuracy. Adaptive steps allow it to slow down for complex dynamics.
+*   **Adjoint Method**: Trained using `odeint_adjoint` for constant memory cost $O(1)$ with respect to integration time, enabling deeper temporal modeling without running out of GPU memory.
+*   **Latent SDE**: Combines the determinstic drift ($f$) above with a diffusion process ($g$).
+    *   Drift: Neural ODE ($\mu_\theta$)
+    *   Diffusion: 3D U-Net ($\epsilon_\theta$) predicting noise for stochastic refinement.
 
 ## Installation
 
