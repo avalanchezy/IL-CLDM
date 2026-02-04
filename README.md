@@ -46,44 +46,73 @@ graph LR
     C -- "28x32x28 (Feature Map)" --> F[Used for Stage 2]
 ```
 
-#### Stage 2: Longitudinal Dynamics (Latent SDE)
-Modeling the temporal evolution $z_0 	o z_{24}$ using Stochastic Differential Equations via `torchsde`.
+#### Stage 2: Longitudinal Dynamics
+
+We offer two dynamic models for trajectory prediction:
+
+**Option A: Latent ODE (Deterministic + Jumps)**
+Best for mean trajectory prediction and utilizing sparse intermediate observations.
 
 ```mermaid
 graph TD
-    subgraph Initialization
-    Z0["Latent z_0"] -->|Input| Solver
-    T["Time t"] -->|Conditioning| Solver
-    L["Label c"] -->|Conditioning| Solver
+    subgraph "Jump Neural ODE"
+        Z0["Latent z_0"] -->|Input| ODE
+        
+        subgraph "Integration Step"
+            ODE["Drift Network f(z,t)"] -->|Integrate| Z_pred["Predicted z(t)"]
+            Z_pred -.->|Check Obs| HasObs{"Has Data?"}
+            HasObs -- Yes --> Jump["Jump Update: z = z + E(z, obs)"]
+            HasObs -- No --> Cont["Continue"]
+            Jump --> Cont
+        end
+        
+        Cont -->|Next Step| ODE
     end
-
-    subgraph "Latent SDE (Continuous Stochastic Dynamics)"
-        direction TB
-        f["Drift Network f(z,t)"]
-        g["Diffusion Network g(z,t)"]
-        
-        Solver["SDE Solver (SRK 1.5)"]
-        
-        Solver -.->|Query| f
-        Solver -.->|Query| g
-        f -.->|Return dz| Solver
-        g -.->|Return g*dw| Solver
-        
-        Solver -->|Integrate| Z_traj["Trajectory z_t"]
-    end
-
-    Z_traj -->|Final State z_24| Decoder
-    Decoder["3D Decoder"] -->|Reconstruct| Out["Predicted PET T24"]
     
-    style Solver fill:#f96,stroke:#333,stroke-width:2px
-    style f fill:#dfd
-    style g fill:#ffd
+    Cont -->|Final t=24| Z24["Final z_24"]
+    Z24 --> Dec["3D Decoder"]
 ```
 
+**Option B: Latent SDE (Stochastic)**
+Best for uncertainty quantification. Solves $dz = f(z,t)dt + g(z,t)dw$.
+
+```mermaid
+graph TD
+    subgraph "Latent SDE (torchsde)"
+        direction TB
+        Input["Latent z_0"] --> Solver["SDE Solver (SRK)"]
+        
+        Solver -.->|Query| Drift["Drift f(z,t) (U-Net)"]
+        Solver -.->|Query| Diff["Diffusion g(z,t) (CNN)"]
+        
+        Drift -.->|Deterministic| Solver
+        Diff -.->|Stochastic dw| Solver
+        
+        Solver -->|Sample Path| Traj["Trajectory z_t"]
+    end
+    
+    Traj -->|Final| Out["Predicted z_24"]
+```
 
 ### Technical Details
 
-#### 1. Network Architecture
+#### 1. Design Philosophy: Why this architecture?
+
+*   **Why Latent Space?**
+    *   **Efficiency**: 3D PET scans ($112 	imes 128 	imes 112$) are too computationally heavy for direct ODE integration. Compressing them to $28 	imes 32 	imes 28$ reduces memory usage by 64x, allowing for deeper dynamic networks.
+    *   **Denoising**: The AAE effectively filters out high-frequency noise, strictly preserving structural metabolic patterns.
+
+*   **Why U-Net for Drift ($f$)?**
+    *   **Structure Preservation**: Disease progression in PET (e.g., Alzheimer's hypometabolism) is localized but structurally correlated. A U-Net backbone captures both local textures and global patterns via skip connections.
+
+*   **Why Latent SDE?**
+    *   **Uncertainty**: Disease progression is inherently stochastic. SDE introduces diffusion ($g$) that models the *variance* of progression, allowing us to estimate confidence intervals.
+
+*   **Why Jump ODE?**
+    *   **Data Sparsity**: Jump ODEs allow the model to "correct" its trajectory *only* when real data is available, making it robust to irregular sampling without imputation bias.
+
+#### 2. Network Components
+
 
 The core of the system is the **Latent ODE Function** ($f(z,t)$), which parameterizes the time derivative of the latent state.
 
