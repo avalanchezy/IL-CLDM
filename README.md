@@ -163,17 +163,8 @@ python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
 | `LatentODE` | Pure Neural ODE | Fast, deterministic predictions |
 | `LatentODEWithIntermediates` | ODE with intermediate observations | Default model for longitudinal data |
 | `LatentSDE` | Drift + Diffusion SDE | Best quality, uncertainty estimation |
-## 📊 Results
 
-The model has been validated on longitudinal Alzheimer's Disease Neuroimaging Initiative (ADNI) datasets.
 
-| Metric | Neural ODE | Latent SDE |
-| :--- | :---: | :---: |
-| **SSIM** | *0.85* | **0.89** |
-| **PSNR** | *28.5* | **30.2** |
-| **LPIPS** | *0.12* | **0.09** |
-
-*(Note: Above values are illustrative placeholders based on typical performance. Please refer to `result/result.txt` after training for your specific experiment stats.)*
 
 ## 🛠️ Configuration
 
