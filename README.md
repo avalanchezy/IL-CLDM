@@ -48,29 +48,42 @@ graph LR
 
 #### Stage 2: Longitudinal Dynamics (Latent SDE)
 
-Modeling the temporal evolution $z_0 	o z_{24}$ using **Stochastic Differential Equations** via `torchsde`. This unified framework captures both the deterministic trend (e.g., brain atrophy) and the stochastic variance of disease progression.
+Modeling the temporal evolution $z_0 	o z_{24}$ using **Stochastic Differential Equations** via `torchsde`. This unified framework captures the mean trend, stochastic variance, and robustly handles **missing data**.
 
 978531 dz_t = f(z_t, t)dt + g(z_t, t)dW_t 978531
 
-*   **Drift $f(z,t)$**: Neural ODE (U-Net) modeling the mean trajectory.
-*   **Diffusion $g(z,t)$**: Stochastic network modeling uncertainty.
+*   **Drift $f$**: Mean trajectory (Neural ODE).
+*   **Diffusion $g$**: Uncertainty estimation.
+*   **Missing Data**: Handled via "Jump / Update" mechanism during integration.
 
 ```mermaid
 graph TD
-    subgraph "Latent SDE Structure"
+    subgraph "Latent SDE Dynamics (Handling Missing Data)"
         direction TB
-        Input["Latent z_0"] --> Solver["SDE Solver (SRK 1.5)"]
         
-        Solver -.->|Query| Drift["Drift f(z,t) (U-Net)"]
-        Solver -.->|Query| Diff["Diffusion g(z,t) (CNN)"]
+        Z0["Latent z_0"] -->|Start| Solver
         
-        Drift -.->|Deterministic| Solver
-        Diff -.->|Stochastic dw| Solver
+        Solver["SDE Solver (SRK 1.5)"]
+        Drift["Drift f(z,t)"]
+        Diff["Diffusion g(z,t)"]
         
-        Solver -->|Sample Path| Traj["Trajectory z_t"]
+        Solver -.->|Query| Drift
+        Solver -.->|Query| Diff
+        
+        Solver -->|Integrate Segment| Check{"Observation Available?"}
+        
+        Check -- "No (Missing)" --> Continue["Continue"]
+        Check -- "Yes (Available)" --> Update["Update State (Jump)"]
+        
+        Update --> Continue
+        Continue -->|Next Segment| Solver
     end
     
-    Traj -->|Final| Out["Predicted z_24"]
+    Solver -->|Final State| ZT["Latent z_T"]
+    
+    style Update fill:#f9f,stroke:#333
+    style Check fill:#ff9,stroke:#333
+    style Solver fill:#f96,stroke:#333
 ```
 
 
