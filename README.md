@@ -52,28 +52,28 @@ Modeling the temporal evolution $z_0 	o z_{24}$ using Stochastic Differential Eq
 ```mermaid
 graph TD
     subgraph Initialization
-    Z0[Latent z0] -->|Input| Solver
-    T[Time t] -->|Conditioning| Solver
-    L[Label c] -->|Conditioning| Solver
+    Z0["Latent z_0"] -->|Input| Solver
+    T["Time t"] -->|Conditioning| Solver
+    L["Label c"] -->|Conditioning| Solver
     end
 
     subgraph "Latent SDE (Continuous Stochastic Dynamics)"
         direction TB
-        f[Drift Network f(z,t)]
-        g[Diffusion Network g(z,t)]
+        f["Drift Network f(z,t)"]
+        g["Diffusion Network g(z,t)"]
         
-        Solver[SDE Solver (SRK 1.5)]
+        Solver["SDE Solver (SRK 1.5)"]
         
         Solver -.->|Query| f
         Solver -.->|Query| g
         f -.->|Return dz| Solver
         g -.->|Return g*dw| Solver
         
-        Solver -->|Integrate| Z_traj[Trajectory zt]
+        Solver -->|Integrate| Z_traj["Trajectory z_t"]
     end
 
-    Z_traj -->|Final State z24| Decoder
-    Decoder[3D Decoder] -->|Reconstruct| Out[Predicted PET T24]
+    Z_traj -->|Final State z_24| Decoder
+    Decoder["3D Decoder"] -->|Reconstruct| Out["Predicted PET T24"]
     
     style Solver fill:#f96,stroke:#333,stroke-width:2px
     style f fill:#dfd
