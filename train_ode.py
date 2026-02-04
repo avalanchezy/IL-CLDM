@@ -18,7 +18,7 @@ from torch import optim
 import numpy as np
 import nibabel as nib
 
-from ode_model import LatentODE, LatentODEWithIntermediates
+from ode_model import LatentODE, LatentODEWithIntermediates, LatentODEDiffusion
 from dataset_longitudinal import SimpleLongitudinalDataset, collate_longitudinal
 from model import AAE, EMA
 from utils import seed_torch, save_checkpoint, load_checkpoint
@@ -83,9 +83,23 @@ def train_ode(args):
     aae.eval()  # Freeze AAE
     
     # ========== Create Neural ODE Model ==========
-    print("\nCreating Neural ODE model...")
+    print("\nCreating model...")
     
-    if args.use_intermediates:
+    model_type = "ODE+Diffusion" if args.use_diffusion else "ODE"
+    print(f"Model type: {model_type}")
+    
+    if args.use_diffusion:
+        # ODE + Diffusion hybrid
+        ode_model = LatentODEDiffusion(
+            latent_channels=config.latent_dim,
+            hidden_channels=getattr(config, 'ode_hidden_dim', 32),
+            time_dim=getattr(config, 'ode_time_dim', 64),
+            num_blocks=getattr(config, 'ode_num_blocks', 3),
+            num_classes=config.num_classes,
+            solver=getattr(config, 'ode_solver', 'dopri5'),
+            diffusion_steps=getattr(config, 'diffusion_steps', 100)
+        ).to(device)
+    elif args.use_intermediates:
         ode_model = LatentODEWithIntermediates(
             latent_channels=config.latent_dim,
             hidden_channels=getattr(config, 'ode_hidden_dim', 32),
@@ -442,6 +456,8 @@ if __name__ == "__main__":
     # Model
     parser.add_argument('--use_intermediates', action='store_true',
                         help='Use intermediate timepoints if available')
+    parser.add_argument('--use_diffusion', action='store_true',
+                        help='Use ODE+Diffusion hybrid model')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint for testing/generation')
     

@@ -1,181 +1,180 @@
 # Longitudinal PET Prediction with Neural ODE
 
-使用神经常微分方程 (Neural ODE) 在潜在空间中预测纵向PET扫描。
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
+[![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## 📋 项目概述
+Predict future PET scans from baseline using Neural ODEs in latent space, with robust handling of **missing intermediate timepoints**.
 
-本项目从基线PET扫描 (T0) 预测未来时间点的PET扫描 (T24)，并能处理**缺失的中间时间点** (T6/T12/T18)。
+## Overview
 
-### 核心思想
+This project predicts longitudinal PET scans (T24) from baseline (T0), handling missing intermediate scans (T6/T12/T18) that may be unavailable due to data collection issues.
 
-- **Stage 1**: 使用对抗自编码器 (AAE) 将3D PET图像压缩到低维潜在空间
-- **Stage 2**: 使用神经ODE在潜在空间建模时间演化动力学
+### Key Features
+
+- **Neural ODE**: Continuous-time dynamics modeling in latent space
+- **ODE + Diffusion Hybrid**: Combines deterministic trajectory with stochastic refinement
+- **Missing Data Handling**: Robust to variable available timepoints per subject
+- **Disease Conditioning**: Optional conditioning on disease stage labels
+
+### Architecture
 
 ```
-T0 PET → AAE Encoder → z_0 → Neural ODE (dz/dt) → z_24 → AAE Decoder → T24 PET
-  (112³)              (28³)   (连续时间动力学)    (28³)               (112³)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                Pipeline: T0 PET → T24 PET Prediction                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Stage 1: AAE (Adversarial Autoencoder)                                 │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │  PET Image (112×128×112) → Encoder → Latent (28×32×28)        │    │
+│  │  Latent (28×32×28) → Decoder → PET Image (112×128×112)        │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  Stage 2: Neural ODE (choose one)                                       │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │  Option A: Pure Neural ODE                                     │    │
+│  │    z_0 → dz/dt = f(z,t) → ODE Solve → z_24                    │    │
+│  │                                                                │    │
+│  │  Option B: ODE + Diffusion (recommended)                       │    │
+│  │    z_0 → Neural ODE → z_mean → Diffusion Refine → z_24        │    │
+│  │              (deterministic)    (stochastic)                   │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 🔧 安装
-
-### 环境要求
-- Python >= 3.8
-- PyTorch >= 2.0.0
-- CUDA >= 11.8
-
-### 安装步骤
+## Installation
 
 ```bash
-# 克隆仓库
+# Clone repository
 git clone https://github.com/avalanchezy/IL-CLDM.git
 cd IL-CLDM
 
-# 创建conda环境
+# Create environment
 conda create -n pet-ode python=3.11
 conda activate pet-ode
 
-# 安装PyTorch (根据CUDA版本调整)
+# Install PyTorch (adjust for your CUDA version)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 安装依赖
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-## 📁 数据准备
+## Data Preparation
 
-### 目录结构
+### Directory Structure
 
 ```
 IL-CLDM/
 ├── data/
-│   ├── {SubjectID}/                    # 每个受试者一个文件夹
-│   │   ├── *_ses-M00_*_pet.nii.gz      # T0 基线扫描
-│   │   ├── *_ses-M06_*_pet.nii.gz      # T6 (可能缺失)
-│   │   ├── *_ses-M12_*_pet.nii.gz      # T12 (可能缺失)
-│   │   └── *_ses-M24_*_pet.nii.gz      # T24 目标扫描
-│   ├── latent/                         # 编码后的潜在表示
-│   └── predictions/                    # 模型预测输出
+│   └── {SubjectID}/
+│       ├── *_ses-M00_*_pet.nii.gz    # Baseline (required)
+│       ├── *_ses-M06_*_pet.nii.gz    # Month 6 (optional)
+│       ├── *_ses-M12_*_pet.nii.gz    # Month 12 (optional)
+│       └── *_ses-M24_*_pet.nii.gz    # Target (required)
 ├── data_info/
-│   ├── data_info.csv                   # 标签文件 (filename, label_id)
-│   ├── train.txt                       # 训练集ID
-│   ├── val.txt                         # 验证集ID
-│   └── test.txt                        # 测试集ID
-└── result/                             # 训练结果和checkpoint
+│   ├── data_info.csv                 # Labels: filename,label_id
+│   ├── train.txt                     # Training subject IDs
+│   ├── val.txt                       # Validation subject IDs
+│   └── test.txt                      # Test subject IDs
+└── result/                           # Checkpoints & logs
 ```
 
-### 数据格式
+## Training
 
-**data_info.csv**:
-```csv
-filename,label_id
-009S4612,0
-010S0067,1
-...
-```
-
-**train.txt / val.txt / test.txt**:
-```
-009S4612
-010S0067
-...
-```
-
-## 🚀 训练流程
-
-### 配置
-
-编辑 `config.py` 设置超参数:
-
-```python
-device = "cuda:0"          # GPU设备
-epochs = 1000              # AAE训练轮数
-ode_epochs = 500           # ODE训练轮数
-batch_size = 2
-num_classes = 4            # 疾病分类数
-```
-
-### Stage 1: 训练AAE
+### Stage 1: Train AAE
 
 ```bash
-# 训练对抗自编码器
+# Train autoencoder
 python main.py --train_aae
 
-# 编码训练数据到潜在空间
-python main.py --enc
+# Encode data to latent space
+python main.py --enc_all
 
-# (可选) 测试AAE重建质量
+# Test reconstruction quality
 python main.py --test_aae
 ```
 
-### Stage 2: 训练Neural ODE
+### Stage 2: Train Prediction Model
 
 ```bash
-# 训练Neural ODE (从T0预测T24)
+# Option A: Pure Neural ODE
 python train_ode.py --train --data_root ./data
 
-# 使用可用的中间时间点 (处理缺失数据)
+# Option B: Neural ODE + Diffusion (recommended)
+python train_ode.py --train --use_diffusion --data_root ./data
+
+# Option C: With intermediate timepoints
 python train_ode.py --train --use_intermediates --data_root ./data
 ```
 
-### 测试与生成
+### Inference
 
 ```bash
-# 测试模型
-python train_ode.py --test --checkpoint result/exp/ODE_epoch500.pth.tar
+# Test model
+python train_ode.py --test --checkpoint result/exp/ODE_best.pth.tar
 
-# 生成预测
-python train_ode.py --generate --checkpoint result/exp/ODE_epoch500.pth.tar
+# Generate predictions
+python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
 ```
 
-## 📊 模型架构
+## Model Variants
 
-### AAE (对抗自编码器)
+| Model | Description | Use Case |
+|-------|-------------|----------|
+| `LatentODE` | Pure Neural ODE | Fast, deterministic predictions |
+| `LatentODEWithIntermediates` | ODE with intermediate observations | When T6/T12 scans are available |
+| `LatentODEDiffusion` | ODE + Diffusion hybrid | Best quality, uncertainty estimation |
 
-| 组件 | 输入 | 输出 |
-|------|------|------|
-| Encoder | (B, 1, 112, 128, 112) | (B, 1, 28, 32, 28) |
-| Decoder | (B, 1, 28, 32, 28) | (B, 1, 112, 128, 112) |
-| Discriminator | (B, 1, 112, 128, 112) | real/fake |
+## Configuration
 
-### Neural ODE
+Edit `config.py` to customize hyperparameters:
 
-| 组件 | 功能 |
-|------|------|
-| LatentODEFunc | 定义 dz/dt = f(z, t; θ)，时间条件3D卷积网络 |
-| LatentODE | ODE积分器，从z_0积分到z_T |
-| LatentODEWithIntermediates | 支持利用可用的中间观测点 |
+```python
+# Device
+device = "cuda:0"
 
-## 📂 文件说明
+# AAE Training
+epochs = 1000
+batch_size = 2
 
-| 文件 | 功能 |
-|------|------|
-| `config.py` | 配置和超参数 |
-| `model.py` | AAE模型 (Encoder, Decoder, Discriminator) |
-| `ode_model.py` | Neural ODE模型 |
-| `dataset.py` | AAE训练数据集 |
-| `dataset_longitudinal.py` | 纵向数据集，支持缺失时间点 |
-| `main.py` | AAE训练入口 |
-| `train_ode.py` | ODE训练入口 |
-| `utils.py` | 工具函数 |
+# Neural ODE
+ode_hidden_dim = 32
+ode_num_blocks = 3
+ode_solver = "dopri5"
+ode_epochs = 500
 
-## 🔍 处理缺失数据
+# Disease classification
+num_classes = 4  # e.g., NC, EMCI, LMCI, AD
+```
 
-本项目的一个关键特性是**处理缺失的中间时间点**：
+## Project Structure
 
-- 有些患者可能只有T0和T24的扫描
-- 有些患者可能有T0、T6、T24
-- 有些患者可能有完整的T0、T6、T12、T18、T24
+| File | Description |
+|------|-------------|
+| `main.py` | Stage 1: AAE training |
+| `train_ode.py` | Stage 2: Neural ODE training |
+| `model.py` | AAE architecture |
+| `ode_model.py` | Neural ODE + Diffusion models |
+| `dataset.py` | AAE dataset |
+| `dataset_longitudinal.py` | Longitudinal dataset with missing data handling |
+| `config.py` | Configuration |
+| `utils.py` | Utilities |
 
-`LatentODEWithIntermediates` 模型会：
-1. 检测每个患者可用的时间点
-2. 当有中间观测时，用它们来修正ODE轨迹
-3. 当无中间观测时，直接从T0积分到T24
+## Citation
 
-## 📧 联系
+If you use this code, please cite:
 
-如有问题，请提交Issue或联系：
-- GitHub: https://github.com/avalanchezy/IL-CLDM
+```bibtex
+@misc{longitudinal-pet-ode,
+  title={Longitudinal PET Prediction with Neural ODE},
+  author={Your Name},
+  year={2024},
+  url={https://github.com/avalanchezy/IL-CLDM}
+}
+```
 
-## 📄 许可证
+## License
 
 MIT License
