@@ -47,41 +47,39 @@ graph LR
 ```
 
 #### Stage 2: Longitudinal Dynamics (Latent SDE)
-Modeling the temporal evolution $z_0 	o z_{24}$ using Stochastic Differential Equations.
+Modeling the temporal evolution $z_0 	o z_{24}$ using Stochastic Differential Equations via `torchsde`.
 
 ```mermaid
 graph TD
     subgraph Initialization
-    Z0[Latent z0] -->|Input| ODE
-    T[Time t] -->|Conditioning| ODE
-    L[Label c] -->|Conditioning| ODE
+    Z0[Latent z0] -->|Input| Solver
+    T[Time t] -->|Conditioning| Solver
+    L[Label c] -->|Conditioning| Solver
     end
 
-    subgraph "Latent SDE (Drift + Diffusion)"
-    
-        subgraph "1. Drift Term (Neural ODE)"
-        ODE[Latent ODE Func] -->|Runge-Kutta 5| Z_pred[Predicted zt]
-        Z_pred -.->|Optional Jump| Obs[Intermediate Obs zt]
-        Obs -->|Refinement| Z_refined[Refined zt]
-        Z_refined -->|Continue| ODE
-        end
+    subgraph "Latent SDE (Continuous Stochastic Dynamics)"
+        direction TB
+        f[Drift Network f(z,t)]
+        g[Diffusion Network g(z,t)]
         
-        subgraph "2. Diffusion Term (Stochastic)"
-        Noise[Gaussian Noise] -->|Add| Z_noisy
-        Z_pred -->|Condition| DiffNet[Diffusion U-Net]
-        Z_noisy -->|Input| DiffNet
-        DiffNet -->|Predict Noise| Eps[Noise e]
-        Eps -->|Denoise| Z_final[Stochastic zt]
-        end
+        Solver[SDE Solver (SRK 1.5)]
         
+        Solver -.->|Query| f
+        Solver -.->|Query| g
+        f -.->|Return dz| Solver
+        g -.->|Return g*dw| Solver
+        
+        Solver -->|Integrate| Z_traj[Trajectory zt]
     end
 
-    Z_final -->|Decoder| Out[Predicted PET T24]
+    Z_traj -->|Final State z24| Decoder
+    Decoder[3D Decoder] -->|Reconstruct| Out[Predicted PET T24]
     
-    style ODE fill:#dfd,stroke:#333
-    style DiffNet fill:#ffd,stroke:#333
-    style Z_final fill:#f9f,stroke:#333,stroke-width:2px
+    style Solver fill:#f96,stroke:#333,stroke-width:2px
+    style f fill:#dfd
+    style g fill:#ffd
 ```
+
 
 ### Technical Details
 
@@ -93,30 +91,20 @@ The core of the system is the **Latent ODE Function** ($f(z,t)$), which paramete
 *   **Backbone**: A lightweight **3D U-Net** operating in latent space.
     *   **Encoder**: 3 blocks of `Conv3D` -> `GroupNorm` -> `Swish` -> `Conv3D` with residual connections.
     *   **Time Conditioning**: Sinusoidal time embeddings projected via MLP and injected into each block (shift/scale).
-    *   **Disease Conditioning**: Learnable class embeddings added to time embeddings.
-    *   **Decoder**: Symmetric path with concatenation skip connections from the encoder.
 *   **Output**: Derivative $dz/dt$ of the same shape as input.
 
-#### 2. Jump ODE for Missing Data
+#### 2. Jump ODE (LatentODE Only)
 
-We employ a **Jump Neural ODE** framework to robustly handle missing intermediate data without imputation.
+For the deterministic `LatentODE` model, we employ a **Jump Neural ODE** framework to handle missing intermediate data.
+*   **Observation Update**: If a real PET scan exists at $T_{curr}$, the model "jumps" to a refined position: $z_{new} = \hat{z}_{curr} + E(\text{cat}(\hat{z}_{curr}, z_{obs}))$.
 
-*   **Mechanism**: The solver integrates the trajectory from $T_{prev}$ to $T_{curr}$.
-*   **Observation Update**: If a real PET scan exists at $T_{curr}$ (e.g., Month 6):
-    1.  The model predicts $\hat{z}_{curr}$ from the ODE integration.
-    2.  The observation encoder processes the concatenation of prediction and real data: $\delta = E(\text{cat}(\hat{z}_{curr}, z_{obs}))$.
-    3.  The state "jumps" to a refined position: $z_{new} = \hat{z}_{curr} + \delta$.
-    4.  Integration continues from $z_{new}$.
-*   **Universal Support**: This logic is built into both `LatentODE` and `LatentSDE`. It automatically activates whenever intermediate data is passed to the forward pass.
+#### 3. True Latent SDE (via `torchsde`)
 
-#### 3. ODE Solver & Optimization
-
-*   **Solver**: `dopri5` (Dormand-Prince), an adaptive step-size Runge-Kutta method (order 5).
-    *   *Why?* Balances speed and accuracy. Adaptive steps allow it to slow down for complex dynamics.
-*   **Adjoint Method**: Trained using `odeint_adjoint` for constant memory cost $O(1)$ with respect to integration time, enabling deeper temporal modeling without running out of GPU memory.
-*   **Latent SDE**: Combines the determinstic drift ($f$) above with a diffusion process ($g$).
-    *   Drift: Neural ODE ($\mu_\theta$)
-    *   Diffusion: 3D U-Net ($\epsilon_\theta$) predicting noise for stochastic refinement.
+The `LatentSDE` model solves a **Stochastic Differential Equation** directly using the `torchsde` library:
+$$dz_t = f(z_t, t)dt + g(z_t, t)dW_t$$
+*   **Drift ($f$)**: The same Neural ODE network used for the deterministic trend.
+*   **Diffusion ($g$)**: A separate network learning state-dependent noise intensity.
+*   **Solver**: `srk` (Strong Runge-Kutta Order 1.5), enabling high-order stochastic integration.
 
 ## Installation
 
@@ -132,7 +120,7 @@ conda activate pet-ode
 # Install PyTorch (adjust for your CUDA version)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Install dependencies
+# Install dependencies (including torchdiffeq and torchsde)
 pip install -r requirements.txt
 ```
 
