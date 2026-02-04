@@ -46,41 +46,20 @@ graph LR
     C -- "28x32x28 (Feature Map)" --> F[Used for Stage 2]
 ```
 
-#### Stage 2: Longitudinal Dynamics
+#### Stage 2: Longitudinal Dynamics (Latent SDE)
 
-We offer two dynamic models for trajectory prediction:
+Modeling the temporal evolution $z_0 	o z_{24}$ using **Stochastic Differential Equations** via `torchsde`. This unified framework captures both the deterministic trend (e.g., brain atrophy) and the stochastic variance of disease progression.
 
-**Option A: Latent ODE (Deterministic + Jumps)**
-Best for mean trajectory prediction and utilizing sparse intermediate observations.
+978531 dz_t = f(z_t, t)dt + g(z_t, t)dW_t 978531
 
-```mermaid
-graph TD
-    subgraph "Jump Neural ODE"
-        Z0["Latent z_0"] -->|Input| ODE
-        
-        subgraph "Integration Step"
-            ODE["Drift Network f(z,t)"] -->|Integrate| Z_pred["Predicted z(t)"]
-            Z_pred -.->|Check Obs| HasObs{"Has Data?"}
-            HasObs -- Yes --> Jump["Jump Update: z = z + E(z, obs)"]
-            HasObs -- No --> Cont["Continue"]
-            Jump --> Cont
-        end
-        
-        Cont -->|Next Step| ODE
-    end
-    
-    Cont -->|Final t=24| Z24["Final z_24"]
-    Z24 --> Dec["3D Decoder"]
-```
-
-**Option B: Latent SDE (Stochastic)**
-Best for uncertainty quantification. Solves $dz = f(z,t)dt + g(z,t)dw$.
+*   **Drift $f(z,t)$**: Neural ODE (U-Net) modeling the mean trajectory.
+*   **Diffusion $g(z,t)$**: Stochastic network modeling uncertainty.
 
 ```mermaid
 graph TD
-    subgraph "Latent SDE (torchsde)"
+    subgraph "Latent SDE Structure"
         direction TB
-        Input["Latent z_0"] --> Solver["SDE Solver (SRK)"]
+        Input["Latent z_0"] --> Solver["SDE Solver (SRK 1.5)"]
         
         Solver -.->|Query| Drift["Drift f(z,t) (U-Net)"]
         Solver -.->|Query| Diff["Diffusion g(z,t) (CNN)"]
@@ -93,6 +72,7 @@ graph TD
     
     Traj -->|Final| Out["Predicted z_24"]
 ```
+
 
 ### Technical Details
 
@@ -111,32 +91,25 @@ graph TD
 *   **Why Latent SDE?**
     *   **Uncertainty**: Disease progression is inherently stochastic. SDE introduces diffusion ($g$) that models the *variance* of progression, allowing us to estimate confidence intervals.
 
-*   **Why Jump ODE?**
-    *   **Data Sparsity**: Jump ODEs allow the model to "correct" its trajectory *only* when real data is available, making it robust to irregular sampling without imputation bias.
+
 
 #### 2. Network Components
 
+The system is built on two primary neural networks within the SDE framework:
 
-The core of the system is the **Latent ODE Function** ($f(z,t)$), which parameterizes the time derivative of the latent state.
+1.  **Drift Network (f)**: The deterministic backbone.
+    *   **Architecture**: 3D U-Net with time-conditioning and skip connections.
+    *   **Role**: Predicts the anatomical evolution field $dz/dt$ (mean trend).
+    *   **Input**: Latent state $z_t$ ($28 	imes 32 	imes 28$) and time $t$.
 
-*   **Input**: Latent state $z_t \in \mathbb{R}^{C \times D \times H \times W}$ (typically $1 \times 28 \times 32 \times 28$) and time $t$.
-*   **Backbone**: A lightweight **3D U-Net** operating in latent space.
-    *   **Encoder**: 3 blocks of `Conv3D` -> `GroupNorm` -> `Swish` -> `Conv3D` with residual connections.
-    *   **Time Conditioning**: Sinusoidal time embeddings projected via MLP and injected into each block (shift/scale).
-*   **Output**: Derivative $dz/dt$ of the same shape as input.
+2.  **Diffusion Network (g)**: The stochastic branch.
+    *   **Architecture**: Lightweight 3D CNN.
+    *   **Role**: Estimates the pixel-wise noise intensity (variance).
+    *   **Effect**: Allows sampling of diverse plausible trajectories for uncertainty quantification.
 
-#### 2. Jump ODE (LatentODE Only)
-
-For the deterministic `LatentODE` model, we employ a **Jump Neural ODE** framework to handle missing intermediate data.
-*   **Observation Update**: If a real PET scan exists at $T_{curr}$, the model "jumps" to a refined position: $z_{new} = \hat{z}_{curr} + E(\text{cat}(\hat{z}_{curr}, z_{obs}))$.
-
-#### 3. True Latent SDE (via `torchsde`)
-
-The `LatentSDE` model solves a **Stochastic Differential Equation** directly using the `torchsde` library:
-$$dz_t = f(z_t, t)dt + g(z_t, t)dW_t$$
-*   **Drift ($f$)**: The same Neural ODE network used for the deterministic trend.
-*   **Diffusion ($g$)**: A separate network learning state-dependent noise intensity.
-*   **Solver**: `srk` (Strong Runge-Kutta Order 1.5), enabling high-order stochastic integration.
+3.  **Solver (torchsde)**:
+    *   **Method**: `srk` (Strong Runge-Kutta Order 1.5).
+    *   **Function**: Integrates the Ito SDE $dz_t = f(z_t, t)dt + g(z_t, t)dW_t$.
 
 ## Installation
 
@@ -194,11 +167,11 @@ python main.py --test_aae
 ### Stage 2: Train Prediction Model
 
 ```bash
-# Option A: Pure Neural ODE (Drift Only)
-python train_ode.py --train --data_root ./data
-
-# Option B: Latent SDE (Drift + Diffusion)
+# Train Latent SDE model (Recommended)
 python train_ode.py --train --use_sde --data_root ./data
+
+# (Optional) Train deterministic baseline
+python train_ode.py --train --data_root ./data
 ```
 
 > **Note**: The model automatically handles missing intermediate timepoints.
