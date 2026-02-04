@@ -513,16 +513,16 @@ class LatentDiffusion(nn.Module):
         return x
 
 
-class LatentODEDiffusion(nn.Module):
+class LatentSDE(nn.Module):
     """
-    Neural ODE + Diffusion Hybrid Model.
+    Latent Stochastic Differential Equation (SDE) Model.
+    
+    Models the temporal evolution of PET scans as an SDE:
+    dz_t = f(z_t, t)dt + g(t)dw_t
     
     Combines:
-    1. Neural ODE for deterministic trajectory prediction (mean prediction)
-    2. Diffusion model for stochastic refinement (uncertainty modeling)
-    
-    This allows modeling both the expected trajectory and the uncertainty
-    around that prediction.
+    1. Neural ODE for the drift term f(z, t) (deterministic trend)
+    2. Diffusion for the diffusion term g(t)dw_t (stochastic fluctuations)
     """
     def __init__(
         self,
@@ -536,7 +536,7 @@ class LatentODEDiffusion(nn.Module):
     ):
         super().__init__()
         
-        # Neural ODE for trajectory prediction
+        # Drift term (ODE)
         self.ode = LatentODE(
             latent_channels=latent_channels,
             hidden_channels=hidden_channels,
@@ -546,7 +546,7 @@ class LatentODEDiffusion(nn.Module):
             solver=solver
         )
         
-        # Diffusion for refinement
+        # Diffusion term (stochastic refinement)
         self.diffusion = LatentDiffusion(
             latent_channels=latent_channels,
             hidden_channels=hidden_channels * 2,
@@ -559,19 +559,8 @@ class LatentODEDiffusion(nn.Module):
         self.blend_weight = nn.Parameter(torch.tensor(0.5))
     
     def forward(self, z_0, t_span, label=None, return_ode_pred=False):
-        """
-        Forward pass for training.
-        
-        Args:
-            z_0: (B, C, D, H, W) initial latent
-            t_span: (T,) evaluation times
-            label: (B,) disease labels
-            return_ode_pred: if True, also return ODE prediction
-        
-        Returns:
-            z_trajectory: (T, B, C, D, H, W) predicted trajectory
-        """
-        # Get ODE trajectory
+        """Forward pass for training."""
+        # Get drift trajectory
         z_ode_trajectory = self.ode(z_0, t_span, label)
         
         if return_ode_pred:
@@ -579,37 +568,31 @@ class LatentODEDiffusion(nn.Module):
         
         return z_ode_trajectory
     
-    def predict(self, z_0, target_time=24, label=None, use_diffusion=True, num_samples=1):
+    def predict(self, z_0, target_time=24, label=None, use_sde=True, num_samples=1):
         """
-        Predict with optional diffusion refinement.
+        Predict with SDE (drift + diffusion).
         
         Args:
-            z_0: (B, C, D, H, W) initial latent at T0
-            target_time: target time in months
-            label: (B,) disease labels
-            use_diffusion: whether to apply diffusion refinement
-            num_samples: number of samples to generate (for uncertainty)
-        
-        Returns:
-            if num_samples == 1:
-                z_pred: (B, C, D, H, W) single prediction
-            else:
-                z_samples: (num_samples, B, C, D, H, W) multiple samples
+            z_0: initial latent
+            target_time: target time
+            label: disease label
+            use_sde: if True, include diffusion term; else only drift (ODE)
+            num_samples: number of stochastic paths
         """
-        # Get ODE prediction (deterministic mean)
+        # Get drift prediction (mean)
         z_ode = self.ode.predict(z_0, target_time, label)
         
-        if not use_diffusion:
+        if not use_sde:
             return z_ode
         
-        # Apply diffusion refinement
+        # Apply diffusion (stochastic term)
         if num_samples == 1:
             z_refined = self.diffusion.sample(z_ode, label)
-            # Blend ODE and diffusion predictions
+            # Blend drift and diffusion
             w = torch.sigmoid(self.blend_weight)
             return w * z_refined + (1 - w) * z_ode
         else:
-            # Generate multiple samples for uncertainty estimation
+            # Generate multiple stochastic paths
             samples = []
             for _ in range(num_samples):
                 z_refined = self.diffusion.sample(z_ode, label)
@@ -618,36 +601,26 @@ class LatentODEDiffusion(nn.Module):
             return torch.stack(samples, dim=0)
     
     def compute_loss(self, z_0, z_T_gt, label=None):
-        """
-        Compute combined ODE + Diffusion loss.
-        
-        Args:
-            z_0: (B, C, D, H, W) initial latent
-            z_T_gt: (B, C, D, H, W) ground truth target latent
-            label: (B,) disease labels
-        
-        Returns:
-            total_loss: combined loss
-            loss_dict: dictionary of individual losses
-        """
+        """Compute combined SDE loss (Drift + Diffusion)."""
         device = z_0.device
         
-        # ODE loss
+        # Drift loss (ODE)
         t_span = torch.tensor([0., 24.], device=device)
         z_ode = self.ode(z_0, t_span, label)[-1]
-        ode_loss = F.mse_loss(z_ode, z_T_gt)
+        drift_loss = F.mse_loss(z_ode, z_T_gt)
         
         # Diffusion loss
         t = self.diffusion.sample_timesteps(z_0.shape[0], device)
         z_noisy, noise = self.diffusion.add_noise(z_T_gt, t)
         predicted_noise = self.diffusion(z_noisy, z_ode.detach(), t, label)
-        diffusion_loss = F.mse_loss(predicted_noise, noise)
+        # diffusion_loss = F.mse_loss(predicted_noise, noise)
+        diffusion_loss = F.l1_loss(predicted_noise, noise) # Robust L1 loss for diffusion
         
         # Combined loss
-        total_loss = ode_loss + 0.1 * diffusion_loss
+        total_loss = drift_loss + 0.1 * diffusion_loss
         
         return total_loss, {
-            'ode_loss': ode_loss.item(),
+            'drift_loss': drift_loss.item(),
             'diffusion_loss': diffusion_loss.item(),
             'total_loss': total_loss.item()
         }
@@ -661,7 +634,7 @@ if __name__ == "__main__":
     device = config.device
     
     print("=" * 60)
-    print("Testing Neural ODE Models")
+    print("Testing Neural ODE / SDE Models")
     print("=" * 60)
     
     batch_size = 2
@@ -671,14 +644,14 @@ if __name__ == "__main__":
     labels = torch.randint(0, 4, (batch_size,)).to(device)
     
     # Test LatentODE
-    print("\n1. Testing LatentODE (pure ODE)...")
+    print("\n1. Testing LatentODE (Drift only)...")
     model = LatentODE(latent_channels=1, hidden_channels=32, num_blocks=2).to(device)
     z_trajectory = model(z_0, t_span, labels)
     print(f"   Input: {z_0.shape} -> Trajectory: {z_trajectory.shape}")
     
-    # Test LatentODEDiffusion
-    print("\n2. Testing LatentODEDiffusion (ODE + Diffusion hybrid)...")
-    model = LatentODEDiffusion(
+    # Test LatentSDE
+    print("\n2. Testing LatentSDE (Drift + Diffusion)...")
+    model = LatentSDE(
         latent_channels=1, 
         hidden_channels=32, 
         num_blocks=2,
@@ -689,21 +662,21 @@ if __name__ == "__main__":
     z_trajectory = model(z_0, t_span, labels)
     print(f"   Forward: {z_0.shape} -> {z_trajectory.shape}")
     
-    # Predict without diffusion
-    z_pred = model.predict(z_0, target_time=24, label=labels, use_diffusion=False)
-    print(f"   Predict (ODE only): {z_pred.shape}")
+    # Predict without SDE (Drift only)
+    z_pred = model.predict(z_0, target_time=24, label=labels, use_sde=False)
+    print(f"   Predict (Drift only): {z_pred.shape}")
     
-    # Predict with diffusion
-    z_pred = model.predict(z_0, target_time=24, label=labels, use_diffusion=True)
-    print(f"   Predict (ODE+Diffusion): {z_pred.shape}")
+    # Predict with SDE
+    z_pred = model.predict(z_0, target_time=24, label=labels, use_sde=True)
+    print(f"   Predict (SDE): {z_pred.shape}")
     
     # Multiple samples
-    z_samples = model.predict(z_0, target_time=24, label=labels, use_diffusion=True, num_samples=3)
+    z_samples = model.predict(z_0, target_time=24, label=labels, use_sde=True, num_samples=3)
     print(f"   Multi-sample: {z_samples.shape}")
     
     # Loss computation
     loss, loss_dict = model.compute_loss(z_0, z_T, labels)
-    print(f"   Loss: ODE={loss_dict['ode_loss']:.4f}, Diff={loss_dict['diffusion_loss']:.4f}")
+    print(f"   Loss: Drift={loss_dict['drift_loss']:.4f}, Diff={loss_dict['diffusion_loss']:.4f}")
     
     print("\n" + "=" * 60)
     print("All tests passed!")

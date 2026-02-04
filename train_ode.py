@@ -18,7 +18,7 @@ from torch import optim
 import numpy as np
 import nibabel as nib
 
-from ode_model import LatentODE, LatentODEWithIntermediates, LatentODEDiffusion
+from ode_model import LatentODE, LatentODEWithIntermediates, LatentSDE
 from dataset_longitudinal import SimpleLongitudinalDataset, collate_longitudinal
 from model import AAE, EMA
 from utils import seed_torch, save_checkpoint, load_checkpoint
@@ -85,12 +85,12 @@ def train_ode(args):
     # ========== Create Neural ODE Model ==========
     print("\nCreating model...")
     
-    model_type = "ODE+Diffusion" if args.use_diffusion else "ODE (with intermediate support)"
+    model_type = "Latent SDE (Drift+Diffusion)" if args.use_sde else "Neural ODE (Drift only)"
     print(f"Model type: {model_type}")
     
-    if args.use_diffusion:
-        # ODE + Diffusion hybrid
-        ode_model = LatentODEDiffusion(
+    if args.use_sde:
+        # Latent SDE: Drift (ODE) + Diffusion
+        ode_model = LatentSDE(
             latent_channels=config.latent_dim,
             hidden_channels=getattr(config, 'ode_hidden_dim', 32),
             time_dim=getattr(config, 'ode_time_dim', 64),
@@ -201,7 +201,7 @@ def train_ode(args):
                 pass
             
             # Forward pass (handles with or without intermediates)
-            if args.use_diffusion:
+            if args.use_sde:
                 z_trajectory = ode_model(z_0, t_span, labels)
             else:
                 z_trajectory = ode_model(z_0, t_span, obs_dict, labels)
@@ -243,7 +243,7 @@ def train_ode(args):
                 t_span = torch.tensor([0., 24.], device=device)
                 
                 # Use EMA model for validation
-                if args.use_diffusion:
+                if args.use_sde:
                     z_trajectory = ema_model(z_0, t_span, labels)
                 else:
                     z_trajectory = ema_model(z_0, t_span, None, labels)
@@ -452,8 +452,8 @@ if __name__ == "__main__":
                         help='Path to label CSV file')
     
     # Model
-    parser.add_argument('--use_diffusion', action='store_true',
-                        help='Use ODE+Diffusion hybrid model for uncertainty estimation')
+    parser.add_argument('--use_sde', action='store_true',
+                        help='Use Latent SDE (Drift + Diffusion) for uncertainty estimation')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to model checkpoint for testing/generation')
     
