@@ -93,8 +93,8 @@ def train_ode(args):
             time_dim=getattr(config, 'ode_time_dim', 64),
             num_blocks=getattr(config, 'ode_num_blocks', 3),
             num_classes=config.num_classes,
-            solver=getattr(config, 'ode_solver', 'dopri5'),
-            diffusion_steps=getattr(config, 'diffusion_steps', 100)
+            solver='srk', # Strong Runge-Kutta 1.5 for SDE
+            diffusion_steps=None # Not used in continuous SDE
         ).to(device)
     else:
         # Neural ODE (Drift only)
@@ -198,13 +198,24 @@ def train_ode(args):
                 pass
             
             # Forward pass (handles with or without intermediates)
-            # Both LatentODE and LatentSDE accept obs_dict
-            z_trajectory = ode_model(z_0, t_span, obs_dict, labels)
             
-            z_T_pred = z_trajectory[-1]  # Prediction at T=24
-            
-            # Loss
-            loss = criterion(z_T_pred, z_T_gt)
+            # Use model-specific loss computation if available (e.g., LatentSDE)
+            if hasattr(ode_model, 'compute_loss'):
+                # Pass z_0, z_T_gt, and labels directly to compute_loss
+                # Note: compute_loss typically handles the forward pass internally for SDEs
+                # due to multiple sampling requirements or variational bounds.
+                loss, loss_dict = ode_model.compute_loss(z_0, z_T_gt, labels)
+                
+                # Check if we need to extract z_T_pred for logging/metrics
+                # (SDE compute_loss might not return prediction for external use easily, 
+                # but we can do a separate predict call or just ignore for training speed)
+                # For compatibility with loop logging, let's assume loss is primary.
+            else:
+                # Standard ODE forward
+                z_trajectory = ode_model(z_0, t_span, obs_dict, labels)
+                z_T_pred = z_trajectory[-1]
+                loss = criterion(z_T_pred, z_T_gt)
+                loss_dict = {'loss': loss.item()}
             
             # Backward
             optimizer.zero_grad()
@@ -218,7 +229,7 @@ def train_ode(args):
             train_loss_sum += loss.item() * z_0.shape[0]
             train_count += z_0.shape[0]
             
-            loop.set_postfix(loss=loss.item())
+            loop.set_postfix(loss=loss_dict.get('total_loss', loss.item()))
         
         avg_train_loss = train_loss_sum / train_count
         

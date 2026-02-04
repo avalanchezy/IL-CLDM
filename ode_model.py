@@ -1,16 +1,18 @@
 """
-Neural ODE model for longitudinal PET prediction in latent space.
-
-This module implements continuous-time dynamics for predicting future PET scans
-from baseline, learning dz/dt = f(z, t; θ) in the latent space.
+Neural ODE and SDE models for longitudinal PET prediction.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchdiffeq import odeint, odeint_adjoint
+import torchsde
 import config
 
+
+# ============================================================
+# Basic Blocks
+# ============================================================
 
 class Swish(nn.Module):
     """Swish activation function."""
@@ -25,12 +27,6 @@ class TimeEmbedding(nn.Module):
         self.dim = dim
         
     def forward(self, t):
-        """
-        Args:
-            t: (B,) or scalar tensor of time values
-        Returns:
-            (B, dim) time embeddings
-        """
         if t.dim() == 0:
             t = t.unsqueeze(0)
         
@@ -52,7 +48,6 @@ class ConvBlock3D(nn.Module):
         self.norm2 = nn.GroupNorm(min(num_groups, out_channels), out_channels)
         self.act = Swish()
         
-        # Time embedding projection
         if time_dim is not None:
             self.time_mlp = nn.Sequential(
                 Swish(),
@@ -61,7 +56,6 @@ class ConvBlock3D(nn.Module):
         else:
             self.time_mlp = None
             
-        # Residual connection
         if in_channels != out_channels:
             self.residual = nn.Conv3d(in_channels, out_channels, 1)
         else:
@@ -72,7 +66,6 @@ class ConvBlock3D(nn.Module):
         h = self.norm1(h)
         h = self.act(h)
         
-        # Add time embedding
         if t_emb is not None and self.time_mlp is not None:
             t_emb = self.time_mlp(t_emb)
             h = h + t_emb[:, :, None, None, None]
@@ -84,12 +77,14 @@ class ConvBlock3D(nn.Module):
         return h + self.residual(x)
 
 
+# ============================================================
+# Core Functions (Drift f & Diffusion g)
+# ============================================================
+
 class LatentODEFunc(nn.Module):
     """
-    ODE function that defines dz/dt = f(z, t; θ).
-    
-    This network operates on 3D latent representations and is conditioned on time.
-    The architecture is a lightweight 3D U-Net style network.
+    Drift function f(t, y) for both ODE and SDE.
+    Architecture: Lightweight 3D U-Net.
     """
     def __init__(
         self,
@@ -97,7 +92,6 @@ class LatentODEFunc(nn.Module):
         hidden_channels=32,
         time_dim=64,
         num_blocks=3,
-        label_dim=None,  # Optional disease label conditioning
         num_classes=4
     ):
         super().__init__()
@@ -110,14 +104,13 @@ class LatentODEFunc(nn.Module):
         )
         
         # Optional label embedding
-        if label_dim is not None or num_classes > 0:
+        if num_classes > 0:
             self.label_embed = nn.Embedding(num_classes, time_dim)
         else:
             self.label_embed = None
         
-        # Encoder path
+        # Encoder
         self.input_conv = nn.Conv3d(latent_channels, hidden_channels, 3, padding=1)
-        
         self.encoder_blocks = nn.ModuleList([
             ConvBlock3D(hidden_channels, hidden_channels, time_dim)
             for _ in range(num_blocks)
@@ -126,534 +119,286 @@ class LatentODEFunc(nn.Module):
         # Middle
         self.middle_block = ConvBlock3D(hidden_channels, hidden_channels, time_dim)
         
-        # Decoder path (same resolution, no downsampling)
+        # Decoder
         self.decoder_blocks = nn.ModuleList([
-            ConvBlock3D(hidden_channels * 2, hidden_channels, time_dim)  # *2 for skip connection
+            ConvBlock3D(hidden_channels * 2, hidden_channels, time_dim)
             for _ in range(num_blocks)
         ])
         
-        # Output: predict dz/dt
+        # Output dz/dt
         self.output_conv = nn.Sequential(
             nn.GroupNorm(min(8, hidden_channels), hidden_channels),
             Swish(),
             nn.Conv3d(hidden_channels, latent_channels, 3, padding=1)
         )
         
-        # Store label for forward pass
         self._label = None
     
     def set_label(self, label):
-        """Set the disease label for conditioning."""
         self._label = label
     
     def forward(self, t, z):
-        """
-        Forward pass computing dz/dt.
-        
-        Args:
-            t: scalar time (normalized to [0, 1] for ODE solver)
-            z: (B, C, D, H, W) latent tensor
-            
-        Returns:
-            dz_dt: (B, C, D, H, W) time derivative of latent
-        """
         # Time embedding
         batch_size = z.shape[0]
         t_tensor = t.expand(batch_size) if t.dim() == 0 else t
         t_emb = self.time_embed(t_tensor)
         t_emb = self.time_mlp(t_emb)
         
-        # Add label embedding if available
         if self.label_embed is not None and self._label is not None:
-            label_emb = self.label_embed(self._label.long())
-            t_emb = t_emb + label_emb
+            t_emb = t_emb + self.label_embed(self._label.long())
         
-        # Forward through network
+        # U-Net structure
         h = self.input_conv(z)
-        
-        # Encoder with skip connections
         skips = []
         for block in self.encoder_blocks:
             h = block(h, t_emb)
             skips.append(h)
         
-        # Middle
         h = self.middle_block(h, t_emb)
         
-        # Decoder with skip connections
         for block, skip in zip(self.decoder_blocks, reversed(skips)):
             h = torch.cat([h, skip], dim=1)
             h = block(h, t_emb)
-        
-        # Output dz/dt
-        dz_dt = self.output_conv(h)
-        
-        return dz_dt
+            
+        return self.output_conv(h)
 
 
-class LatentODE(nn.Module):
+class DiffusionFunc(nn.Module):
     """
-    Neural ODE for longitudinal PET prediction.
-    
-    Given z_0 (latent at T0), predicts z_T (latent at target time T).
-    
-    Universal Intermediate Handling:
-    If intermediate observations (e.g., T6, T12) are provided during the forward pass,
-    the model automatically uses them to refine the trajectory via a "Jump ODE" mechanism.
+    Diffusion function g(t, y) for SDE.
+    Architecture: Similar to Drift but simpler, predicting log-sigma for diagonal noise.
     """
     def __init__(
         self,
         latent_channels=1,
         hidden_channels=32,
         time_dim=64,
-        num_blocks=3,
-        num_classes=4,
-        solver='dopri5',
-        rtol=1e-5,
-        atol=1e-7,
-        use_adjoint=True
+        num_classes=4
     ):
         super().__init__()
         
-        # ODE Function (Drift dynamics)
-        self.odefunc = LatentODEFunc(
-            latent_channels=latent_channels,
-            hidden_channels=hidden_channels,
-            time_dim=time_dim,
-            num_blocks=num_blocks,
-            num_classes=num_classes
-        )
-        
-        self.solver = solver
-        self.rtol = rtol
-        self.atol = atol
-        self.use_adjoint = use_adjoint
-        
-        # Choose ODE integrator
-        self.odeint = odeint_adjoint if use_adjoint else odeint
-
-        # Observation Encoder (for jump updates)
-        # Refines latent state using actual observations when available
-        self.obs_encoder = nn.Sequential(
-            nn.Conv3d(latent_channels * 2, hidden_channels, 3, padding=1),
-            nn.GroupNorm(8, hidden_channels),
-            Swish(),
-            nn.Conv3d(hidden_channels, latent_channels, 3, padding=1)
-        )
-    
-    def forward(self, z_0, t_span, observations=None, label=None):
-        """
-        Integrate from z_0 with optional intermediate observations.
-        
-        Args:
-            z_0: (B, C, D, H, W) initial latent state
-            t_span: (T,) tensor of times to evaluate [0, t1, t2, ..., T]
-            observations: dict {time: z_obs} or list of dicts of available observations
-                          If provided, trajectory performs jumps at observation times.
-            label: (B,) optional disease labels
-            
-        Returns:
-            z_trajectory: (T, B, C, D, H, W) latent states at each time
-        """
-        # Set label for conditioning
-        self.odefunc.set_label(label)
-        
-        # Case 1: No intermediates - Standard Integration
-        if observations is None or len(observations) == 0:
-            t_normalized = t_span / t_span[-1]
-            return self.odeint(
-                self.odefunc,
-                z_0,
-                t_normalized,
-                method=self.solver,
-                rtol=self.rtol,
-                atol=self.atol
-            )
-        
-        # Case 2: With intermediates - Jump Integration
-        # Integrate segment by segment, updating at observations
-        z_current = z_0
-        z_trajectory = [z_0]
-        
-        times = t_span.tolist()
-        
-        # Normalize times based on max time in span
-        max_t = times[-1]
-        
-        for i in range(1, len(times)):
-            # Define segment normalized to [0, 1] scale relative to max_t
-            t_prev_norm = times[i-1] / max_t
-            t_curr_norm = times[i] / max_t
-            t_segment = torch.tensor([t_prev_norm, t_curr_norm], device=z_0.device)
-            
-            # Integrate this segment
-            # Note: odeint returns partial trajectory, we only need the endpoint
-            segment_out = self.odeint(
-                self.odefunc,
-                z_current,
-                t_segment,
-                method=self.solver,
-                rtol=self.rtol,
-                atol=self.atol
-            )
-            z_pred = segment_out[-1]
-            
-            # Check for observation at this time (t_current)
-            t_current = times[i]
-            
-            # Handle observation dictionary structure
-            z_obs = None
-            if isinstance(observations, dict) and t_current in observations:
-                z_obs = observations[t_current]
-            elif isinstance(observations, list): # List of dicts per sample? 
-                # Simplified: assumes batch-averaged or pre-collated observation tensor
-                # For robust implementation, observations should preferably be a Tensor (B, C, D, H, W) masked,
-                # or a dict mapping time -> Tensor.
-                # Assuming dict {time_float: Tensor(B, C...)} here as per previous logic
-                pass
-
-            if z_obs is not None:
-                # Jump Update: Refine prediction with observation
-                combined = torch.cat([z_pred, z_obs], dim=1)
-                z_refined = z_pred + self.obs_encoder(combined)
-                z_trajectory.append(z_refined)
-                z_current = z_refined
-            else:
-                z_trajectory.append(z_pred)
-                z_current = z_pred
-        
-        return torch.stack(z_trajectory, dim=0)
-    
-    def predict(self, z_0, target_time=24, label=None):
-        """Predict latent at a single target time (no intermediates)."""
-        t_span = torch.tensor([0.0, float(target_time)], device=z_0.device)
-        z_trajectory = self.forward(z_0, t_span, None, label)
-        return z_trajectory[-1]
-
-
-# ============================================================
-# Diffusion Components for ODE + Diffusion Hybrid
-# ============================================================
-
-class LatentDiffusion(nn.Module):
-    """
-    Diffusion model operating in latent space.
-    
-    Used to refine Neural ODE predictions by adding controlled stochasticity,
-    modeling prediction uncertainty.
-    """
-    def __init__(
-        self,
-        latent_channels=1,
-        hidden_channels=64,
-        time_dim=64,
-        num_classes=4,
-        noise_steps=100,  # Fewer steps for refinement (not full generation)
-        beta_start=1e-4,
-        beta_end=0.02
-    ):
-        super().__init__()
-        
-        self.noise_steps = noise_steps
-        self.latent_channels = latent_channels
-        
-        # Noise schedule
-        self.register_buffer('beta', torch.linspace(beta_start, beta_end, noise_steps))
-        self.register_buffer('alpha', 1.0 - self.beta)
-        self.register_buffer('alpha_hat', torch.cumprod(self.alpha, dim=0))
-        
-        # Time embedding
         self.time_embed = TimeEmbedding(time_dim)
         self.time_mlp = nn.Sequential(
-            nn.Linear(time_dim, time_dim * 4),
+            nn.Linear(time_dim, time_dim),
             Swish(),
-            nn.Linear(time_dim * 4, time_dim)
+            nn.Linear(time_dim, time_dim)
         )
         
-        # Label embedding
-        self.label_embed = nn.Embedding(num_classes, time_dim) if num_classes > 0 else None
-        
-        # Denoising network (simplified UNet-like)
-        self.input_conv = nn.Conv3d(latent_channels * 2, hidden_channels, 3, padding=1)  # *2 for condition
-        
-        self.down1 = ConvBlock3D(hidden_channels, hidden_channels, time_dim)
-        self.down2 = ConvBlock3D(hidden_channels, hidden_channels * 2, time_dim)
-        
-        self.mid = ConvBlock3D(hidden_channels * 2, hidden_channels * 2, time_dim)
-        
-        self.up1 = ConvBlock3D(hidden_channels * 4, hidden_channels, time_dim)  # *4 for skip
-        self.up2 = ConvBlock3D(hidden_channels * 2, hidden_channels, time_dim)
-        
-        self.output_conv = nn.Sequential(
-            nn.GroupNorm(8, hidden_channels),
+        if num_classes > 0:
+            self.label_embed = nn.Embedding(num_classes, time_dim)
+        else:
+            self.label_embed = None
+
+        # Simple 3D CNN for diffusion coefficient
+        self.net = nn.Sequential(
+            nn.Conv3d(latent_channels, hidden_channels, 3, padding=1),
+            Swish(),
+            nn.Conv3d(hidden_channels, hidden_channels, 3, padding=1),
             Swish(),
             nn.Conv3d(hidden_channels, latent_channels, 3, padding=1)
         )
-    
-    def forward(self, x_t, condition, t, label=None):
-        """
-        Predict noise given noisy latent, condition, and timestep.
         
-        Args:
-            x_t: (B, C, D, H, W) noisy latent
-            condition: (B, C, D, H, W) ODE prediction (condition for refinement)
-            t: (B,) diffusion timesteps
-            label: (B,) optional disease labels
-        
-        Returns:
-            predicted_noise: (B, C, D, H, W)
-        """
-        # Time embedding
-        t_emb = self.time_embed(t)
+        self._label = None
+
+    def set_label(self, label):
+        self._label = label
+
+    def forward(self, t, y):
+        batch_size = y.shape[0]
+        t_tensor = t.expand(batch_size) if t.dim() == 0 else t
+        t_emb = self.time_embed(t_tensor)
         t_emb = self.time_mlp(t_emb)
         
-        # Add label embedding
-        if self.label_embed is not None and label is not None:
-            t_emb = t_emb + self.label_embed(label.long())
+        if self.label_embed is not None and self._label is not None:
+            t_emb = t_emb + self.label_embed(self._label.long())
         
-        # Concatenate noisy input with condition
-        x = torch.cat([x_t, condition], dim=1)
-        x = self.input_conv(x)
+        # Combine y and t (simplified injection for diffusion)
+        # Note: Ideally inject t into convs, here we add it to input scaling for simplicity
+        # or just use the net. For robustness, let's keep it simple.
+        # Diffusion needs to be positive. We output log_sigma and exp() it.
+        # Standard SDE: g(t, y).
         
-        # Encoder
-        h1 = self.down1(x, t_emb)
-        h2 = self.down2(h1, t_emb)
+        out = self.net(y)
+        # Add time effect global modulation
+        t_scale = torch.sigmoid(t_emb).mean(dim=1).view(batch_size, 1, 1, 1, 1)
         
-        # Middle
-        h = self.mid(h2, t_emb)
-        
-        # Decoder with skip connections
-        h = self.up1(torch.cat([h, h2], dim=1), t_emb)
-        h = self.up2(torch.cat([h, h1], dim=1), t_emb)
-        
-        return self.output_conv(h)
+        # Return sigma. Softplus for positivity + small epsilon
+        return F.softplus(out) * t_scale + 1e-3
+
+
+# ============================================================
+# SDE System Wrapper
+# ============================================================
+
+class SDEWrapper(nn.Module):
+    """Wraps f and g for torchsde, handling flattening for 2D requirement."""
+    def __init__(self, f_func, g_func, shape):
+        super().__init__()
+        self.f_func = f_func
+        self.g_func = g_func
+        self.shape = shape # (C, D, H, W) without batch
+        self.noise_type = "diagonal"
+        self.sde_type = "ito"
     
-    def add_noise(self, x, t):
-        """Add noise to latent at timestep t."""
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None, None]
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None, None]
-        noise = torch.randn_like(x)
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * noise, noise
+    def f(self, t, y):
+        # y is (B, D*H*W*C)
+        B = y.shape[0]
+        y_reshaped = y.view(B, *self.shape)
+        out = self.f_func(t, y_reshaped)
+        return out.view(B, -1)
     
-    def sample_timesteps(self, n, device):
-        """Sample random timesteps for training."""
-        return torch.randint(0, self.noise_steps, (n,), device=device)
-    
-    @torch.no_grad()
-    def sample(self, condition, label=None, num_steps=None):
-        """
-        Denoise from condition (ODE prediction) to refined prediction.
+    def g(self, t, y):
+        B = y.shape[0]
+        y_reshaped = y.view(B, *self.shape)
+        out = self.g_func(t, y_reshaped)
+        return out.view(B, -1)
+
+
+# ============================================================
+# Models
+# ============================================================
+
+class LatentODE(nn.Module):
+    """Standard Neural ODE (Drift only)."""
+    def __init__(self, latent_channels=1, hidden_channels=32, time_dim=64, num_blocks=3, num_classes=4, solver='dopri5'):
+        super().__init__()
+        self.odefunc = LatentODEFunc(latent_channels, hidden_channels, time_dim, num_blocks, num_classes)
+        self.solver = solver
         
-        Args:
-            condition: (B, C, D, H, W) ODE prediction to refine
-            label: (B,) disease labels
-            num_steps: number of denoising steps (default: noise_steps)
+    def forward(self, z_0, t_span, observations=None, label=None):
+        self.odefunc.set_label(label)
+        t_normalized = t_span / t_span[-1]
+        z = odeint(self.odefunc, z_0, t_normalized, method=self.solver, rtol=1e-4, atol=1e-5)
+        return z
         
-        Returns:
-            refined: (B, C, D, H, W) refined prediction
-        """
-        device = condition.device
-        b = condition.shape[0]
-        
-        if num_steps is None:
-            num_steps = self.noise_steps
-        
-        # Start from noisy version of condition
-        x = condition + torch.randn_like(condition) * 0.1  # Small initial noise
-        
-        # Reverse diffusion
-        step_size = max(1, self.noise_steps // num_steps)
-        timesteps = list(range(self.noise_steps - 1, -1, -step_size))
-        
-        for t in timesteps:
-            t_tensor = torch.full((b,), t, device=device, dtype=torch.long)
-            
-            # Predict noise
-            predicted_noise = self(x, condition, t_tensor, label)
-            
-            # Compute denoising step
-            alpha = self.alpha[t]
-            alpha_hat = self.alpha_hat[t]
-            beta = self.beta[t]
-            
-            if t > 0:
-                noise = torch.randn_like(x)
-            else:
-                noise = torch.zeros_like(x)
-            
-            x = (1 / torch.sqrt(alpha)) * (
-                x - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * predicted_noise
-            ) + torch.sqrt(beta) * noise
-        
-        return x
+    def predict(self, z_0, target_time=24, label=None):
+        t = torch.tensor([0., float(target_time)], device=z_0.device)
+        return self.forward(z_0, t, None, label)[-1]
 
 
 class LatentSDE(nn.Module):
     """
-    Latent Stochastic Differential Equation (SDE) Model.
-    
-    Models the temporal evolution of PET scans as an SDE:
-    dz_t = f(z_t, t)dt + g(t)dw_t
-    
-    Combines:
-    1. Neural ODE for the drift term f(z, t) (deterministic trend)
-    2. Diffusion for the diffusion term g(t)dw_t (stochastic fluctuations)
+    True Latent SDE using torchsde.
+    Wrapper around torchsde.sdeint.
     """
-    def __init__(
-        self,
-        latent_channels=1,
-        hidden_channels=32,
-        time_dim=64,
-        num_blocks=3,
-        num_classes=4,
-        solver='dopri5',
-        diffusion_steps=100
-    ):
+    def __init__(self, latent_channels=1, hidden_channels=32, time_dim=64, num_blocks=3, num_classes=4, solver='srk', diffusion_steps=None):
         super().__init__()
         
-        # Drift term (ODE)
-        self.ode = LatentODE(
-            latent_channels=latent_channels,
-            hidden_channels=hidden_channels,
-            time_dim=time_dim,
-            num_blocks=num_blocks,
-            num_classes=num_classes,
-            solver=solver
-        )
+        self.f_func = LatentODEFunc(latent_channels, hidden_channels, time_dim, num_blocks, num_classes)
+        self.g_func = DiffusionFunc(latent_channels, hidden_channels // 2, time_dim, num_classes)
         
-        # Diffusion term (stochastic refinement)
-        self.diffusion = LatentDiffusion(
-            latent_channels=latent_channels,
-            hidden_channels=hidden_channels * 2,
-            time_dim=time_dim,
-            num_classes=num_classes,
-            noise_steps=diffusion_steps
-        )
+        # SDEWrapper initialized with shape later or passed?
+        # We need shape for reshaping. Since shape is fixed (C, D, H, W), we can infer or pass.
+        # But D, H, W might vary? In this project seems fixed (28x32x28).
+        # Let's handle it dynamically if possible, or store shape from first forward?
+        # torchsde requires the object to be passed.
+        # We will create SDEWrapper in forward pass or update its shape.
+        self.sde_system = None # Created on fly
+        self.latent_channels = latent_channels
         
-        # Learnable blend weight
-        self.blend_weight = nn.Parameter(torch.tensor(0.5))
-    
-    def forward(self, z_0, t_span, observations=None, label=None, return_ode_pred=False):
-        """Forward pass for training."""
-        # Get drift trajectory (handles jumps if observations provided)
-        z_ode_trajectory = self.ode(z_0, t_span, observations, label)
+        self.solver = solver 
+        self.dt = 0.05
         
-        if return_ode_pred:
-            return z_ode_trajectory, z_ode_trajectory
+    def _get_sde_system(self, shape):
+        # shape: (C, D, H, W)
+        return SDEWrapper(self.f_func, self.g_func, shape)
         
-        return z_ode_trajectory
-    
-    def predict(self, z_0, target_time=24, label=None, use_sde=True, num_samples=1):
+    def forward(self, z_0, t_span, observations=None, label=None):
         """
-        Predict with SDE (drift + diffusion).
-        
         Args:
-            z_0: initial latent
-            target_time: target time
-            label: disease label
-            use_sde: if True, include diffusion term; else only drift (ODE)
-            num_samples: number of stochastic paths
+            z_0: (B, C, D, H, W)
         """
-        # Get drift prediction (mean)
-        z_ode = self.ode.predict(z_0, target_time, label)
+        self.f_func.set_label(label)
+        self.g_func.set_label(label)
         
-        if not use_sde:
-            return z_ode
+        batch_size = z_0.shape[0]
+        shape_without_batch = z_0.shape[1:] # (C, D, H, W)
+        flat_dim = z_0.numel() // batch_size
         
-        # Apply diffusion (stochastic term)
-        if num_samples == 1:
-            z_refined = self.diffusion.sample(z_ode, label)
-            # Blend drift and diffusion
-            w = torch.sigmoid(self.blend_weight)
-            return w * z_refined + (1 - w) * z_ode
+        # Flatten input
+        z_0_flat = z_0.view(batch_size, -1)
+        
+        # Create wrapper
+        sde_system = self._get_sde_system(shape_without_batch)
+        
+        z_traj_flat = torchsde.sdeint(
+            sde_system,
+            z_0_flat,
+            t_span,
+            method='srk', 
+            dt=self.dt,
+            names={'drift': 'f', 'diffusion': 'g'}
+        )
+        
+        # Reshape back: (T, B, C, D, H, W)
+        T = z_traj_flat.shape[0]
+        z_traj = z_traj_flat.view(T, batch_size, *shape_without_batch)
+        
+        return z_traj
+
+    def predict(self, z_0, target_time=24, label=None, num_samples=1):
+        t_span = torch.tensor([0., float(target_time)], device=z_0.device)
+        self.f_func.set_label(label)
+        self.g_func.set_label(label)
+        
+        shape_without_batch = z_0.shape[1:]
+        sde_system = self._get_sde_system(shape_without_batch)
+        
+        is_expanded = False 
+        
+        if num_samples > 1:
+            z_0_start = z_0.repeat(num_samples, 1, 1, 1, 1)
+            if label is not None:
+                expanded_label = label.repeat(num_samples)
+                self.f_func.set_label(expanded_label)
+                self.g_func.set_label(expanded_label)
+            is_expanded = True
+            current_batch_size = z_0.shape[0] * num_samples
         else:
-            # Generate multiple stochastic paths
-            samples = []
-            for _ in range(num_samples):
-                z_refined = self.diffusion.sample(z_ode, label)
-                w = torch.sigmoid(self.blend_weight)
-                samples.append(w * z_refined + (1 - w) * z_ode)
-            return torch.stack(samples, dim=0)
-    
+            z_0_start = z_0
+            current_batch_size = z_0.shape[0]
+            
+        z_0_flat = z_0_start.view(current_batch_size, -1)
+        
+        traj_flat = torchsde.sdeint(sde_system, z_0_flat, t_span, method='srk', dt=self.dt)
+        z_T_flat = traj_flat[-1]
+        
+        # Reshape
+        z_T = z_T_flat.view(current_batch_size, *shape_without_batch)
+        
+        if is_expanded:
+            # Reshape to (samples, batch, ...)
+            z_T = z_T.view(num_samples, z_0.shape[0], *shape_without_batch)
+            # Restore labels
+            self.f_func.set_label(label)
+            self.g_func.set_label(label)
+            return z_T.mean(dim=0)
+            
+        return z_T
+
     def compute_loss(self, z_0, z_T_gt, label=None):
-        """Compute combined SDE loss (Drift + Diffusion)."""
-        device = z_0.device
+        """
+        SDE Training Loss.
+        Ideally: Variational loss.
+        Simplification: MSE of trajectory samples.
+        """
+        # Generate prediction (single sample path)
+        t_span = torch.tensor([0., 24.], device=z_0.device)
+        z_pred = self.forward(z_0, t_span, label=label)[-1]
         
-        # Drift loss (ODE)
-        t_span = torch.tensor([0., 24.], device=device)
-        z_ode = self.ode(z_0, t_span, label)[-1]
-        drift_loss = F.mse_loss(z_ode, z_T_gt)
+        loss = F.mse_loss(z_pred, z_T_gt)
+        # Add regularization to encourage non-zero diffusion?
+        # For now, basic MSE.
         
-        # Diffusion loss
-        t = self.diffusion.sample_timesteps(z_0.shape[0], device)
-        z_noisy, noise = self.diffusion.add_noise(z_T_gt, t)
-        predicted_noise = self.diffusion(z_noisy, z_ode.detach(), t, label)
-        # diffusion_loss = F.mse_loss(predicted_noise, noise)
-        diffusion_loss = F.l1_loss(predicted_noise, noise) # Robust L1 loss for diffusion
-        
-        # Combined loss
-        total_loss = drift_loss + 0.1 * diffusion_loss
-        
-        return total_loss, {
-            'drift_loss': drift_loss.item(),
-            'diffusion_loss': diffusion_loss.item(),
-            'total_loss': total_loss.item()
-        }
+        return loss, {'loss': loss.item()}
 
-
-# ============================================================
-# Testing
-# ============================================================
 
 if __name__ == "__main__":
-    device = config.device
-    
-    print("=" * 60)
-    print("Testing Neural ODE / SDE Models")
-    print("=" * 60)
-    
-    batch_size = 2
-    z_0 = torch.randn(batch_size, 1, 28, 32, 28).to(device)
-    z_T = torch.randn(batch_size, 1, 28, 32, 28).to(device)
-    t_span = torch.tensor([0., 6., 12., 24.]).to(device)
-    labels = torch.randint(0, 4, (batch_size,)).to(device)
-    
-    # Test LatentODE
-    print("\n1. Testing LatentODE (Drift only)...")
-    model = LatentODE(latent_channels=1, hidden_channels=32, num_blocks=2).to(device)
-    z_trajectory = model(z_0, t_span, labels)
-    print(f"   Input: {z_0.shape} -> Trajectory: {z_trajectory.shape}")
-    
-    # Test LatentSDE
-    print("\n2. Testing LatentSDE (Drift + Diffusion)...")
-    model = LatentSDE(
-        latent_channels=1, 
-        hidden_channels=32, 
-        num_blocks=2,
-        diffusion_steps=50
-    ).to(device)
-    
-    # Forward
-    z_trajectory = model(z_0, t_span, labels)
-    print(f"   Forward: {z_0.shape} -> {z_trajectory.shape}")
-    
-    # Predict without SDE (Drift only)
-    z_pred = model.predict(z_0, target_time=24, label=labels, use_sde=False)
-    print(f"   Predict (Drift only): {z_pred.shape}")
-    
-    # Predict with SDE
-    z_pred = model.predict(z_0, target_time=24, label=labels, use_sde=True)
-    print(f"   Predict (SDE): {z_pred.shape}")
-    
-    # Multiple samples
-    z_samples = model.predict(z_0, target_time=24, label=labels, use_sde=True, num_samples=3)
-    print(f"   Multi-sample: {z_samples.shape}")
-    
-    # Loss computation
-    loss, loss_dict = model.compute_loss(z_0, z_T, labels)
-    print(f"   Loss: Drift={loss_dict['drift_loss']:.4f}, Diff={loss_dict['diffusion_loss']:.4f}")
-    
-    print("\n" + "=" * 60)
-    print("All tests passed!")
-    print("=" * 60)
-
+    # Test
+    print("Testing SDE...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    z = torch.randn(2, 1, 28, 32, 28).to(device)
+    t = torch.tensor([0., 24.]).to(device)
+    model = LatentSDE().to(device)
+    out = model(z, t)
+    print(out.shape)
