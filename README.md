@@ -23,28 +23,66 @@ A key challenge in longitudinal medical imaging is **missing data**. Patients of
 
 ### Architecture
 
+#### Stage 1: Latent Representation Learning (AAE)
+3D Adversarial Autoencoder compresses high-dimensional PET scans into a compact latent space.
+
+```mermaid
+graph LR
+    subgraph Input
+    A[PET Volume] -->|1x112x128x112| B
+    end
+    
+    subgraph AAE[Adversarial Autoencoder]
+    B[3D Encoder] -->|Conv3D + Downsample| C(Latent Code z)
+    C -->|Vector Quantization / BottleNeck| C
+    C -->|Conv3D + Upsample| D[3D Decoder]
+    end
+    
+    subgraph Output
+    D -->|1x112x128x112| E[Reconstructed PET]
+    end
+    
+    style C fill:#f9f,stroke:#333,stroke-width:2px,color:black
+    C -- "28x32x28 (Feature Map)" --> F[Used for Stage 2]
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                Pipeline: T0 PET → T24 PET Prediction                     │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  Stage 1: AAE (Adversarial Autoencoder)                                 │
-│  ┌────────────────────────────────────────────────────────────────┐    │
-│  │  PET Image (112×128×112) → Encoder → Latent (28×32×28)        │    │
-│  │  Latent (28×32×28) → Decoder → PET Image (112×128×112)        │    │
-│  └────────────────────────────────────────────────────────────────┘    │
-│                                                                         │
-│  Stage 2: Latent Dynamics (Neural ODE / SDE)                            │
-│  ┌────────────────────────────────────────────────────────────────┐    │
-│  │  Option A: Neural ODE (Deterministic Drift)                    │    │
-│  │    dz/dt = f(z,t)                                              │    │
-│  │    Focus: Mean prediction, structural boundaries               │    │
-│  │                                                                │    │
-│  │  Option B: Latent SDE (Drift + Diffusion)                      │    │
-│  │    dz_t = f(z,t)dt + g(t)dw_t                                  │    │
-│  │    Focus: Uncertainty modeling, texture details                │    │
-│  └────────────────────────────────────────────────────────────────┘    │
-│                                                                         │
+
+#### Stage 2: Longitudinal Dynamics (Latent SDE)
+Modeling the temporal evolution $z_0 	o z_{24}$ using Stochastic Differential Equations.
+
+```mermaid
+graph TD
+    subgraph Initialization
+    Z0[Latent z0] -->|Input| ODE
+    T[Time t] -->|Conditioning| ODE
+    L[Label c] -->|Conditioning| ODE
+    end
+
+    subgraph "Latent SDE (Drift + Diffusion)"
+    
+        subgraph "1. Drift Term (Neural ODE)"
+        ODE[Latent ODE Func] -->|Runge-Kutta 5| Z_pred[Predicted zt]
+        Z_pred -.->|Optional Jump| Obs[Intermediate Obs zt]
+        Obs -->|Refinement| Z_refined[Refined zt]
+        Z_refined -->|Continue| ODE
+        end
+        
+        subgraph "2. Diffusion Term (Stochastic)"
+        Noise[Gaussian Noise] -->|Add| Z_noisy
+        Z_pred -->|Condition| DiffNet[Diffusion U-Net]
+        Z_noisy -->|Input| DiffNet
+        DiffNet -->|Predict Noise| Eps[Noise e]
+        Eps -->|Denoise| Z_final[Stochastic zt]
+        end
+        
+    end
+
+    Z_final -->|Decoder| Out[Predicted PET T24]
+    
+    style ODE fill:#dfd,stroke:#333
+    style DiffNet fill:#ffd,stroke:#333
+    style Z_final fill:#f9f,stroke:#333,stroke-width:2px
+```
+
 ### Technical Details
 
 #### 1. Network Architecture
@@ -160,8 +198,7 @@ python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
 
 | Model | Description | Use Case |
 |-------|-------------|----------|
-| `LatentODE` | Pure Neural ODE | Fast, deterministic predictions |
-| `LatentODEWithIntermediates` | ODE with intermediate observations | Default model for longitudinal data |
+| `LatentODE` | Pure Neural ODE | Fast, deterministic predictions, handles missing data |
 | `LatentSDE` | Drift + Diffusion SDE | Best quality, uncertainty estimation |
 
 
