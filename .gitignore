@@ -1,0 +1,32 @@
+# Data files
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Results and outputs (optional - uncomment if you don't want to upload)
+# result/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
