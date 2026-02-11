@@ -4,102 +4,65 @@
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Predict future PET scans using Stochastic Differential Equations (SDEs), utilizing latent dynamics to robustly handle missing intermediate data.**
-
----
-
-## 🏗️ System Architecture
-
-### 1. High-Level Pipeline (Complete View)
-
-The system transforms high-dimensional PET scans into a compact latent space, models their specific temporal evolution using an SDE, and reconstructs the future state.
-
-```mermaid
-graph LR
-    subgraph "Stage 1: Compression"
-    Img[Input PET] --> Enc[AAE Encoder] --> Z0[Latent z_0]
-    end
-    
-    subgraph "Stage 2: Prediction"
-    Z0 --> SDE[Latent SDE Model] --> ZT[Latent z_T]
-    end
-    
-    subgraph "Stage 3: Reconstruction"
-    ZT --> Dec[AAE Decoder] --> Pred[Prediction]
-    end
-    
-    style SDE fill:#f96,stroke:#333,stroke-width:2px
-```
-
-### 2. Latent SDE Architecture (Specific Detail)
-
-Inside the `Latent SDE Model` block, we solve the equation $dz_t = f(z,t)dt + g(z,t)dw_t$.
-
-```mermaid
-graph TD
-    subgraph "SDE Integration Process"
-        direction TB
-        
-        state_t["State z(t)"]
-        
-        subgraph "1. Network Evaluation"
-            direction TB
-            f["Drift Network f (U-Net)"]
-            g["Diffusion Network g (CNN)"]
-            
-            state_t --> f
-            state_t --> g
-        end
-        
-        subgraph "2. Solver Step (SRK)"
-            calc["Calculates dz = f*dt + g*dw"]
-            f -.-> calc
-            g -.-> calc
-            step["Integrated State z(t+dt)"]
-            calc --> step
-        end
-
-        subgraph "3. Missing Data Handling"
-            check{"Has Observation?"}
-            jump["Jump Update: z = z + Encoder(z, Obs)"]
-            
-            step --> check
-            check -- "Yes" --> jump --> next["State z(next)"]
-            check -- "No" --> next
-        end
-    end
-    
-    next --> state_t
-```
-
----
-
-## ⚙️ Architecture & Parameter Specifications
-
-### SDE Components
-
-| Component | Architecture | Specification | Rationale |
-|-----------|--------------|---------------|-----------|
-| **Drift ($f$)** | **3D U-Net** | • **3 Encoder Blocks** (Conv3D-GN-Swish)<br>• **Channels**: 32 (Base) $\to$ 64 $\to$ 128<br>• **Conditions**: Time ($sin$ emb) + Label (learned emb) | A U-Net captures multi-scale features. High-res path preserves texture (local metabolism), low-res path captures global atrophy structure. |
-| **Diffusion ($g$)** | **3D CNN** | • **3 Conv Blocks** (No pooling)<br>• **Output**: Softplus (positive noise scale) | Diffusion needs to be spatially adaptive (e.g., higher uncertainty in ventricles) but simpler than Drift. A shallow CNN is sufficient and stable. |
-| **Latent Space** | **Compressed Grid** | • **Shape**: $8 \times 28 \times 32 \times 28$<br>• **Compression Ratio**: ~64x | Direct voxel-wise ODE is intractable. $28^3$ is the "sweet spot" retaining structure while allowing extensive temporal computation. |
-
-### Solver Configuration
-
-*   **Algorithm**: `srk` (Strong Runge-Kutta Order 1.5).
-    *   *Why?* Standard Euler-Maruyama (Order 0.5/1.0) is too imprecise for image generation. SRK offers better convergence for diagonal noise.
-*   **Step Size**: Fixed `dt=0.05`.
-    *   *Why?* Stochastic solvers often struggle with adaptive steps. A fixed fine-grained step ensures stability.
+> **Predict future brain PET scans from baseline using Neural Stochastic Differential Equations, with robust handling of missing intermediate timepoints and built-in uncertainty quantification.**
 
 ---
 
 ## 📖 Overview
 
-Predicting the progression of Alzheimer's Disease (AD) via longitudinal PET scans is critical for early diagnosis. This project leverages continuous-time **Neural SDEs** to model patient trajectories even with **missing intermediate visits**.
+Predicting the progression of Alzheimer's Disease (AD) via longitudinal PET imaging is critical for early diagnosis and treatment planning. However, two fundamental challenges exist:
 
-### Key Features
-- **Uncertainty Quantification**: Implicitly models variance via the diffusion term.
-- **Robustness**: Handles sparse data (e.g., missing Month 6 scan) naturally via continuous integration.
+1.  **Missing Data**: Patients frequently miss intermediate visits (Month 6, 12, or 18), resulting in irregular time series.
+2.  **Uncertainty**: Disease progression is inherently stochastic — the same baseline can lead to different outcomes.
+
+This project addresses both challenges with a **Latent SDE** framework that models disease trajectories as continuous-time stochastic processes.
+
+---
+
+## 🏗️ Framework
+
+![Framework](image/framework.png)
+
+The system consists of two stages:
+
+**Stage 1 (Green, top):** An Adversarial Autoencoder (AAE) compresses high-dimensional PET volumes ($1 \times 112 \times 128 \times 112$) into a compact latent representation $z$ ($8 \times 28 \times 32 \times 28$), achieving ~64x compression.
+
+**Stage 2 (Blue/Yellow, bottom):** A **Neural SDE Solver** evolves the latent state $z_0$ forward along a continuous time axis ($t = 0 \to 6 \to 12 \to 18 \to 24$ months). The solver combines:
+-   **Drift $f(z,t)$**: Predicts the *mean* trajectory (deterministic trend, e.g., brain atrophy patterns).
+-   **Diffusion $g(z,t)$**: Predicts *noise intensity* (stochastic variance), enabling uncertainty quantification.
+-   **Condition**: Disease stage label $y$ (CN/MCI/AD) conditions both $f$ and $g$.
+-   **Noise**: Brownian motion $dW_t$ injected at each step, generating diverse sample paths.
+
+The SDE being solved is:
+
+$$dz_t = f(z_t, t; y)\,dt + g(z_t, t; y)\,dW_t$$
+
+---
+
+## ⚙️ Architecture & Parameter Specifications
+
+### Network Components
+
+| Component | Architecture | Key Parameters | Role |
+|-----------|-------------|----------------|------|
+| **Drift ($f$)** | 3D U-Net | 3 encoder/decoder blocks, 32→64→128 channels, skip connections, time+label conditioning | Predicts the anatomical evolution field $dz/dt$ (mean trajectory) |
+| **Diffusion ($g$)** | 3D CNN | 3 conv layers (no pooling), Softplus output (ensures $g > 0$) | Estimates state-dependent noise intensity (uncertainty) |
+| **AAE Encoder** | 3D Conv | Downsampling: $112^3 \to 28^3$ | Compresses PET to latent space |
+| **AAE Decoder** | 3D ConvTranspose | Upsampling: $28^3 \to 112^3$ | Reconstructs PET from latent space |
+
+### Why This Design?
+
+-   **Drift uses U-Net**: Disease progression (e.g., hippocampal atrophy) is spatially structured. U-Net's skip connections preserve both local texture and global morphology simultaneously.
+-   **Diffusion uses simple CNN**: Uncertainty estimation is smoother and lower-frequency than the trajectory itself. A lightweight network prevents training collapse (where $g \to 0$ or $g$ dominates $f$).
+-   **Shared conditioning**: Both $f$ and $g$ receive the same time embedding (sinusoidal) and disease label embedding, ensuring stage-aware dynamics.
+
+### Solver
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| **Method** | `srk` (Strong Runge-Kutta 1.5) | Higher-order convergence for diagonal noise SDEs |
+| **Step size** | `dt = 0.05` | Fixed step for stochastic stability |
+| **Noise type** | Diagonal (Itô) | Each latent dimension has independent noise |
 
 ---
 
@@ -109,45 +72,56 @@ Predicting the progression of Alzheimer's Disease (AD) via longitudinal PET scan
 git clone https://github.com/avalanchezy/IL-CLDM.git
 cd IL-CLDM
 
-conda create -n pet-ode python=3.11
-conda activate pet-ode
+conda create -n pet-sde python=3.11
+conda activate pet-sde
 
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
 
+> **Key dependencies**: `torchsde` (SDE solver), `torchdiffeq` (ODE baseline), `nibabel` (NIfTI I/O)
+
 ---
 
 ## ⚡ Training
 
-### 1. Train AAE (Compression Stage)
+### Stage 1: Train AAE
 ```bash
-python main.py --train_aae
-python main.py --enc_all
+python main.py --train_aae      # Train autoencoder
+python main.py --enc_all        # Encode all data to latent .pt files
 ```
 
-### 2. Train Latent SDE (Dynamics Stage)
+### Stage 2: Train Latent SDE
 ```bash
 python train_ode.py --train --use_sde --data_root ./data
 ```
+
+> **Note**: The model automatically handles missing intermediate timepoints. When available, Month 6/12/18 scans improve trajectory accuracy.
 
 ---
 
 ## 🔮 Inference
 
 ```bash
-# Generate predictions
+python train_ode.py --test --checkpoint result/exp/ODE_best.pth.tar
 python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
 ```
 
 ---
 
-## 🛠️ Configuration (config.py)
-*   `ode_hidden_dim`: 32 (Width of U-Net)
-*   `latent_dim`: 8 (Channels in latent space)
-*   `learning_rate`: 1e-4
+## 🛠️ Configuration (`config.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ode_hidden_dim` | 32 | Channel width of the Drift U-Net |
+| `latent_dim` | 8 | Channels in latent space |
+| `ode_solver` | `srk` | SDE solver algorithm |
+| `learning_rate` | 1e-4 | Training learning rate |
+
+---
 
 ## 📜 Citation
+
 ```bibtex
 @misc{latent-sde-pet,
   title={Latent SDE for Longitudinal PET Prediction},
@@ -155,3 +129,7 @@ python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
   url={https://github.com/avalanchezy/IL-CLDM}
 }
 ```
+
+## 📄 License
+
+Distributed under the MIT License.
