@@ -189,13 +189,19 @@ def train_ode(args):
             # Predict z_T from z_0
             t_span = torch.tensor([0., 24.], device=device)
             
-            # Get intermediates if available
-            obs_dict = None
+            # Construct obs_dict from batch intermediates
+            obs_dict = {}
             if batch['intermediates'] and len(batch['intermediates']) > 0:
-                # batch['intermediates'] is a list of dicts, one per sample
-                # For simplicity, we pass None here and let the model handle it
-                # In full implementation, would pass observations properly
-                pass
+                for sample_intermediates in batch['intermediates']:
+                    for month, z_obs in sample_intermediates.items():
+                        if month not in obs_dict:
+                            obs_dict[month] = [z_obs.to(device)]
+                        else:
+                            obs_dict[month].append(z_obs.to(device))
+                # Stack per-sample tensors into batched tensors
+                obs_dict = {m: torch.stack(vs) for m, vs in obs_dict.items()}
+            if not obs_dict:
+                obs_dict = None
             
             # Forward pass (handles with or without intermediates)
             
@@ -245,8 +251,6 @@ def train_ode(args):
                 z_0 = batch['z_0'].to(device)
                 z_T_gt = batch['z_T'].to(device)
                 labels = batch['labels'].to(device)
-                
-                t_span = torch.tensor([0., 24.], device=device)
                 
                 t_span = torch.tensor([0., 24.], device=device)
                 
@@ -306,12 +310,22 @@ def test_ode(args):
         load_checkpoint(config.CHECKPOINT_AAE, aae, aae_opt, config.learning_rate)
     aae.eval()
     
-    ode_model = LatentODE(
-        latent_channels=config.latent_dim,
-        hidden_channels=getattr(config, 'ode_hidden_dim', 32),
-        num_blocks=getattr(config, 'ode_num_blocks', 3),
-        num_classes=config.num_classes
-    ).to(device)
+    if args.use_sde:
+        ode_model = LatentSDE(
+            latent_channels=config.latent_dim,
+            hidden_channels=getattr(config, 'ode_hidden_dim', 32),
+            time_dim=getattr(config, 'ode_time_dim', 64),
+            num_blocks=getattr(config, 'ode_num_blocks', 3),
+            num_classes=config.num_classes,
+            solver='srk'
+        ).to(device)
+    else:
+        ode_model = LatentODE(
+            latent_channels=config.latent_dim,
+            hidden_channels=getattr(config, 'ode_hidden_dim', 32),
+            num_blocks=getattr(config, 'ode_num_blocks', 3),
+            num_classes=config.num_classes
+        ).to(device)
     
     ode_opt = optim.AdamW(ode_model.parameters(), lr=config.learning_rate)
     
@@ -351,7 +365,7 @@ def test_ode(args):
             labels = batch['labels'].to(device)
             
             t_span = torch.tensor([0., 24.], device=device)
-            z_trajectory = ode_model(z_0, t_span, labels)
+            z_trajectory = ode_model(z_0, t_span, None, labels)
             z_T_pred = torch.clamp(z_trajectory[-1], 0, 1)
             
             # Decode to image space for evaluation
@@ -387,12 +401,22 @@ def generate_predictions(args):
         load_checkpoint(config.CHECKPOINT_AAE, aae, aae_opt, config.learning_rate)
     aae.eval()
     
-    ode_model = LatentODE(
-        latent_channels=config.latent_dim,
-        hidden_channels=getattr(config, 'ode_hidden_dim', 32),
-        num_blocks=getattr(config, 'ode_num_blocks', 3),
-        num_classes=config.num_classes
-    ).to(device)
+    if args.use_sde:
+        ode_model = LatentSDE(
+            latent_channels=config.latent_dim,
+            hidden_channels=getattr(config, 'ode_hidden_dim', 32),
+            time_dim=getattr(config, 'ode_time_dim', 64),
+            num_blocks=getattr(config, 'ode_num_blocks', 3),
+            num_classes=config.num_classes,
+            solver='srk'
+        ).to(device)
+    else:
+        ode_model = LatentODE(
+            latent_channels=config.latent_dim,
+            hidden_channels=getattr(config, 'ode_hidden_dim', 32),
+            num_blocks=getattr(config, 'ode_num_blocks', 3),
+            num_classes=config.num_classes
+        ).to(device)
     
     ode_opt = optim.AdamW(ode_model.parameters(), lr=config.learning_rate)
     
@@ -423,7 +447,7 @@ def generate_predictions(args):
             subject_id = batch['subject_ids'][0]
             
             t_span = torch.tensor([0., 24.], device=device)
-            z_trajectory = ode_model(z_0, t_span, labels)
+            z_trajectory = ode_model(z_0, t_span, None, labels)
             z_T_pred = torch.clamp(z_trajectory[-1], 0, 1)
             
             # Decode

@@ -66,13 +66,10 @@ CHECKPOINT_ODE = "result/" + exp + "ODE.pth.tar"
 ode_hidden_dim = 32         # Hidden channels in ODE function
 ode_time_dim = 64           # Time embedding dimension
 ode_num_blocks = 3          # Number of conv blocks in ODE function
-ode_solver = "dopri5"       # ODE solver: 'dopri5', 'euler', 'rk4', 'midpoint'
+ode_solver = "srk"          # SDE solver: 'srk' (recommended), or 'dopri5' for ODE
 ode_rtol = 1e-5             # Relative tolerance for adaptive solvers
 ode_atol = 1e-7             # Absolute tolerance for adaptive solvers
-ode_epochs = 500            # Epochs for ODE training
-
-# Diffusion term (for Latent SDE)
-diffusion_steps = 100       # Number of diffusion steps for stochastic refinement
+ode_epochs = 500            # Epochs for ODE/SDE training
 
 # Timepoints (in months)
 timepoints = [0, 6, 12, 18, 24]

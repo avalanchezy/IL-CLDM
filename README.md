@@ -49,6 +49,7 @@ $$dz_t = f(z_t, t; y)\,dt + g(z_t, t; y)\,dW_t$$
 | **Diffusion ($g$)** | 3D CNN | 3 conv layers (no pooling), Softplus output (ensures $g > 0$) | Estimates state-dependent noise intensity (uncertainty) |
 | **AAE Encoder** | 3D Conv | Downsampling: $112^3 \to 28^3$ | Compresses PET to latent space |
 | **AAE Decoder** | 3D ConvTranspose | Upsampling: $28^3 \to 112^3$ | Reconstructs PET from latent space |
+| **Latent Space** | Compressed Grid | Shape: $1 \times 28 \times 32 \times 28$ (~64x compression) | Compact spatial representation |
 
 ### Why This Design?
 

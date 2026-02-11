@@ -259,17 +259,65 @@ class SDEWrapper(nn.Module):
 # ============================================================
 
 class LatentODE(nn.Module):
-    """Standard Neural ODE (Drift only)."""
+    """Standard Neural ODE (Drift only, with optional Jump for intermediates)."""
     def __init__(self, latent_channels=1, hidden_channels=32, time_dim=64, num_blocks=3, num_classes=4, solver='dopri5'):
         super().__init__()
         self.odefunc = LatentODEFunc(latent_channels, hidden_channels, time_dim, num_blocks, num_classes)
         self.solver = solver
         
+        # Observation encoder for jump updates
+        self.obs_encoder = nn.Sequential(
+            nn.Conv3d(latent_channels * 2, hidden_channels, 3, padding=1),
+            nn.GroupNorm(min(8, hidden_channels), hidden_channels),
+            Swish(),
+            nn.Conv3d(hidden_channels, latent_channels, 3, padding=1)
+        )
+        
     def forward(self, z_0, t_span, observations=None, label=None):
         self.odefunc.set_label(label)
-        t_normalized = t_span / t_span[-1]
-        z = odeint(self.odefunc, z_0, t_normalized, method=self.solver, rtol=1e-4, atol=1e-5)
-        return z
+        
+        # Case 1: No intermediates - single-span integration
+        if observations is None or len(observations) == 0:
+            t_normalized = t_span / t_span[-1]
+            z = odeint(self.odefunc, z_0, t_normalized, method=self.solver, rtol=1e-4, atol=1e-5)
+            return z
+        
+        # Case 2: With intermediates - segment-by-segment with jumps
+        obs_times = sorted(observations.keys())
+        all_times = sorted(set([0] + obs_times + [t_span[-1].item()]))
+        max_t = float(t_span[-1])
+        
+        z_current = z_0
+        z_trajectory = [z_0]
+        
+        for i in range(len(all_times) - 1):
+            t_start = all_times[i]
+            t_end = all_times[i + 1]
+            
+            t_segment = torch.tensor(
+                [t_start / max_t, t_end / max_t],
+                device=z_0.device
+            )
+            
+            seg_result = odeint(
+                self.odefunc, z_current, t_segment,
+                method=self.solver, rtol=1e-4, atol=1e-5
+            )
+            z_pred = seg_result[-1]
+            
+            # Jump update if observation available at t_end
+            t_end_int = int(t_end)
+            if t_end_int in observations:
+                z_obs = observations[t_end_int]
+                combined = torch.cat([z_pred, z_obs], dim=1)
+                z_refined = z_pred + self.obs_encoder(combined)
+                z_trajectory.append(z_refined)
+                z_current = z_refined
+            else:
+                z_trajectory.append(z_pred)
+                z_current = z_pred
+        
+        return torch.stack(z_trajectory, dim=0)
         
     def predict(self, z_0, target_time=24, label=None):
         t = torch.tensor([0., float(target_time)], device=z_0.device)
@@ -299,42 +347,89 @@ class LatentSDE(nn.Module):
         self.solver = solver 
         self.dt = 0.05
         
+        # Observation encoder for jump updates (same as LatentODE)
+        hidden_ch = hidden_channels
+        self.obs_encoder = nn.Sequential(
+            nn.Conv3d(latent_channels * 2, hidden_ch, 3, padding=1),
+            nn.GroupNorm(min(8, hidden_ch), hidden_ch),
+            Swish(),
+            nn.Conv3d(hidden_ch, latent_channels, 3, padding=1)
+        )
+        
     def _get_sde_system(self, shape):
         # shape: (C, D, H, W)
         return SDEWrapper(self.f_func, self.g_func, shape)
         
     def forward(self, z_0, t_span, observations=None, label=None):
         """
+        Forward pass with optional segment-by-segment integration.
+        
         Args:
-            z_0: (B, C, D, H, W)
+            z_0: (B, C, D, H, W) initial latent state
+            t_span: tensor of timepoints, e.g. [0, 24] or [0, 6, 12, 18, 24]
+            observations: dict {month: (B, C, D, H, W)} of intermediate observations, or None
+            label: (B,) disease labels
         """
         self.f_func.set_label(label)
         self.g_func.set_label(label)
         
         batch_size = z_0.shape[0]
-        shape_without_batch = z_0.shape[1:] # (C, D, H, W)
-        flat_dim = z_0.numel() // batch_size
+        shape_without_batch = z_0.shape[1:]  # (C, D, H, W)
         
-        # Flatten input
-        z_0_flat = z_0.view(batch_size, -1)
+        # Case 1: No intermediates - single-span integration
+        if observations is None or len(observations) == 0:
+            z_0_flat = z_0.view(batch_size, -1)
+            sde_system = self._get_sde_system(shape_without_batch)
+            
+            z_traj_flat = torchsde.sdeint(
+                sde_system, z_0_flat, t_span,
+                method='srk', dt=self.dt,
+                names={'drift': 'f', 'diffusion': 'g'}
+            )
+            T = z_traj_flat.shape[0]
+            return z_traj_flat.view(T, batch_size, *shape_without_batch)
         
-        # Create wrapper
+        # Case 2: With intermediates - segment-by-segment with jumps
+        # Build sorted list of all timepoints to integrate through
+        obs_times = sorted(observations.keys())
+        all_times = sorted(set([0] + obs_times + [t_span[-1].item()]))
+        
         sde_system = self._get_sde_system(shape_without_batch)
+        z_current = z_0
+        z_trajectory = [z_0]
+        max_t = float(t_span[-1])
         
-        z_traj_flat = torchsde.sdeint(
-            sde_system,
-            z_0_flat,
-            t_span,
-            method='srk', 
-            dt=self.dt,
-            names={'drift': 'f', 'diffusion': 'g'}
-        )
+        for i in range(len(all_times) - 1):
+            t_start = all_times[i]
+            t_end = all_times[i + 1]
+            
+            # Normalize to [0, 1] for numerical stability
+            t_segment = torch.tensor(
+                [t_start / max_t, t_end / max_t],
+                device=z_0.device
+            )
+            
+            z_flat = z_current.view(batch_size, -1)
+            seg_traj = torchsde.sdeint(
+                sde_system, z_flat, t_segment,
+                method='srk', dt=self.dt,
+                names={'drift': 'f', 'diffusion': 'g'}
+            )
+            z_pred = seg_traj[-1].view(batch_size, *shape_without_batch)
+            
+            # Jump update if observation available at t_end
+            t_end_int = int(t_end)
+            if t_end_int in observations:
+                z_obs = observations[t_end_int]
+                combined = torch.cat([z_pred, z_obs], dim=1)
+                z_refined = z_pred + self.obs_encoder(combined)
+                z_trajectory.append(z_refined)
+                z_current = z_refined
+            else:
+                z_trajectory.append(z_pred)
+                z_current = z_pred
         
-        # Reshape back: (T, B, C, D, H, W)
-        T = z_traj_flat.shape[0]
-        z_traj = z_traj_flat.view(T, batch_size, *shape_without_batch)
-        
-        return z_traj
+        return torch.stack(z_trajectory, dim=0)
 
     def predict(self, z_0, target_time=24, label=None, num_samples=1):
         t_span = torch.tensor([0., float(target_time)], device=z_0.device)
