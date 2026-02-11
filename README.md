@@ -97,15 +97,42 @@ python main.py --enc_all        # Encode all data to latent .pt files
 python train_ode.py --train --use_sde --data_root ./data
 ```
 
-> **Note**: The model automatically handles missing intermediate timepoints. When available, Month 6/12/18 scans improve trajectory accuracy.
+> **Note**: The model automatically handles missing intermediate timepoints via a **Jump mechanism**. When M06/M12/M18 scans are available, the SDE integrates segment-by-segment and fuses observations at each timepoint.
+
+---
+
+## 🧪 Quick Pipeline Test
+
+Verify the entire pipeline (AAE → SDE → Decode) on 3 sample patients before full training:
+
+```bash
+# Train SDE on 010S0067 + 011S0010, test on 009S4612
+python test_pipeline.py
+```
+
+**What it does:**
+1. Loads the pre-trained AAE checkpoint
+2. Encodes all PET scans (M00, M06, M12, M24) to latent space
+3. Trains SDE for 200 epochs on 2 patients (with intermediate Jump updates)
+4. Predicts M24 for the held-out patient from M00 only
+5. Saves predicted/ground-truth NIfTI to `result/pipeline_test/`
+
+**Expected output:**
+```
+Pipeline Test Summary
+  AAE:          ✓ Loaded & working
+  SDE Training: ✓ 200 epochs on ['010S0067', '011S0010']
+  SDE Testing:  ✓ Predicted M24 for ['009S4612']
+  Intermediates: ✓ M06/M12 used during training (Jump mechanism)
+```
 
 ---
 
 ## 🔮 Inference
 
 ```bash
-python train_ode.py --test --checkpoint result/exp/ODE_best.pth.tar
-python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
+python train_ode.py --test --use_sde --checkpoint result/exp/ODE_best.pth.tar
+python train_ode.py --generate --use_sde --checkpoint result/exp/ODE_best.pth.tar
 ```
 
 ---
@@ -115,9 +142,10 @@ python train_ode.py --generate --checkpoint result/exp/ODE_best.pth.tar
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `ode_hidden_dim` | 32 | Channel width of the Drift U-Net |
-| `latent_dim` | 8 | Channels in latent space |
+| `latent_dim` | 1 | Latent channels |
 | `ode_solver` | `srk` | SDE solver algorithm |
 | `learning_rate` | 1e-4 | Training learning rate |
+| `ode_epochs` | 500 | Training epochs |
 
 ---
 
